@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ((EUID != 0)); then
+  exec sudo -- "$0" "$@"
+fi
+
+gdm_home=$(getent passwd gdm | cut -d: -f6)
+if [[ -z "$gdm_home" ]]; then
+  printf 'The gdm user does not exist. Nothing to remove.\n'
+  exit 0
+fi
+readonly CONFIG_DIR="${gdm_home}/.config"
+readonly TARGET="${CONFIG_DIR}/monitors.xml"
+readonly BACKUP="${TARGET}.before-sunshine-display"
+
+if [[ -e "$BACKUP" ]]; then
+  mv -f "$BACKUP" "$TARGET"
+  printf 'Restored the greeter display configuration that existed before.\n'
+else
+  rm -f "$TARGET"
+  rmdir --ignore-fail-on-non-empty "$CONFIG_DIR" 2>/dev/null || true
+  printf 'Removed %s.\n' "$TARGET"
+fi
+
+printf 'The greeter will use every connected output again, including the virtual one.\n'

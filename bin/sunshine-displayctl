@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PHYSICAL_CONNECTOR="DP-1"
+readonly PHYSICAL_MODE="1920x1080@165.001"
+readonly VIRTUAL_CONNECTOR="HDMI-1"
+readonly VIRTUAL_MODE="3840x2160@59.997"
+readonly SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
+readonly INHIBIT_SERVICE="sunshine-display-inhibit.service"
+
+uid=$(id -u)
+: "${XDG_RUNTIME_DIR:=/run/user/${uid}}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=${XDG_RUNTIME_DIR}/bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/sunshine-display-manager"
+readonly SETTINGS_FILE="${CONFIG_DIR}/settings"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR}/sunshine-display-manager"
+readonly STATE_FILE="${RUNTIME_DIR}/state"
+readonly LOCK_FILE="${RUNTIME_DIR}/control.lock"
+
+mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR"
+exec 9>"$LOCK_FILE"
+flock -x 9
+
+AUTO_HIDE_PHYSICAL=1
+STREAM_ACTIVE=0
+PRE_STREAM_TOPOLOGY="unknown"
+MANUAL_OVERRIDE=0
+
+load_settings() {
+  local key value
+
+  [[ -r "$SETTINGS_FILE" ]] || return 0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      auto_hide_physical)
+        case "$value" in
+          1 | true | yes | enabled) AUTO_HIDE_PHYSICAL=1 ;;
+          0 | false | no | disabled) AUTO_HIDE_PHYSICAL=0 ;;
+        esac
+        ;;
+    esac
+  done <"$SETTINGS_FILE"
+}
+
+save_settings() {
+  local tmp
+  tmp=$(mktemp "${CONFIG_DIR}/settings.XXXXXX")
+  printf 'auto_hide_physical=%s\n' "$AUTO_HIDE_PHYSICAL" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$SETTINGS_FILE"
+}
+
+load_runtime_state() {
+  local key value
+
+  STREAM_ACTIVE=0
+  PRE_STREAM_TOPOLOGY="unknown"
+  MANUAL_OVERRIDE=0
+  [[ -r "$STATE_FILE" ]] || return 0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      stream_active)
+        if [[ "$value" == 1 ]]; then
+          STREAM_ACTIVE=1
+        fi
+        ;;
+      pre_stream_topology)
+        case "$value" in
+          physical-only | virtual-only | both | unknown)
+            PRE_STREAM_TOPOLOGY=$value
+            ;;
+        esac
+        ;;
+      manual_override)
+        if [[ "$value" == 1 ]]; then
+          MANUAL_OVERRIDE=1
+        fi
+        ;;
+    esac
+  done <"$STATE_FILE"
+}
+
+save_runtime_state() {
+  local tmp
+  tmp=$(mktemp "${RUNTIME_DIR}/state.XXXXXX")
+  printf 'stream_active=%s\n' "$STREAM_ACTIVE" >"$tmp"
+  printf 'pre_stream_topology=%s\n' "$PRE_STREAM_TOPOLOGY" >>"$tmp"
+  printf 'manual_override=%s\n' "$MANUAL_OVERRIDE" >>"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
+require_gnome_session() {
+  if [[ ! -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+    printf 'GNOME session bus is unavailable at %s. Is the desktop user logged in?\n' \
+      "${XDG_RUNTIME_DIR}/bus" >&2
+    return 1
+  fi
+}
+
+current_topology() {
+  local state="${1:-}" logical physical=false virtual=false
+
+  if [[ -z "$state" ]]; then
+    require_gnome_session
+    state=$(gdctl show --properties)
+  fi
+  logical=${state#*Logical monitors:}
+  if [[ "$logical" == "$state" ]]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if grep -Fq "${PHYSICAL_CONNECTOR} (" <<<"$logical"; then
+    physical=true
+  fi
+  if grep -Fq "${VIRTUAL_CONNECTOR} (" <<<"$logical"; then
+    virtual=true
+  fi
+
+  if $physical && $virtual; then
+    printf 'both\n'
+  elif $physical; then
+    printf 'physical-only\n'
+  elif $virtual; then
+    printf 'virtual-only\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+verify_flag() {
+  if [[ "${1:-}" == verify ]]; then
+    printf '%s\n' '--verify'
+  fi
+}
+
+apply_physical_only() {
+  local verify
+  verify=$(verify_flag "${1:-}")
+  gdctl set ${verify:+"$verify"} --layout-mode logical \
+    --logical-monitor --primary --scale 1 --x 0 --y 0 \
+    --monitor "$PHYSICAL_CONNECTOR" --mode "$PHYSICAL_MODE" \
+    --color-mode default --rgb-range auto
+}
+
+apply_virtual_only() {
+  local verify
+  verify=$(verify_flag "${1:-}")
+  gdctl set ${verify:+"$verify"} --layout-mode logical \
+    --logical-monitor --primary --scale 1 --x 0 --y 0 \
+    --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
+    --color-mode bt2100 --rgb-range auto
+}
+
+apply_both() {
+  local verify
+  verify=$(verify_flag "${1:-}")
+  gdctl set ${verify:+"$verify"} --layout-mode logical \
+    --logical-monitor --scale 1 --x 0 --y 0 \
+    --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
+    --color-mode bt2100 --rgb-range auto \
+    --logical-monitor --primary --scale 1 --x 552 --y 2160 \
+    --monitor "$PHYSICAL_CONNECTOR" --mode "$PHYSICAL_MODE" \
+    --color-mode default --rgb-range auto
+}
+
+apply_topology() {
+  case "$1" in
+    physical-only) apply_physical_only ;;
+    virtual-only) apply_virtual_only ;;
+    both) apply_both ;;
+    *)
+      printf 'Cannot apply unknown display topology: %s\n' "$1" >&2
+      return 1
+      ;;
+  esac
+}
+
+mark_manual_override() {
+  load_runtime_state
+  if ((STREAM_ACTIVE)); then
+    MANUAL_OVERRIDE=1
+    save_runtime_state
+  fi
+}
+
+manual_apply() {
+  apply_topology "$1"
+  mark_manual_override
+}
+
+start_inhibitor() {
+  systemctl --user stop "$INHIBIT_SERVICE" >/dev/null 2>&1 || true
+  systemd-run --user --quiet --collect --unit="${INHIBIT_SERVICE%.service}" \
+    /usr/bin/gnome-session-inhibit \
+    --app-id=sunshine-display-manager \
+    --reason=Sunshine-stream-active \
+    --inhibit=idle --inhibit=suspend --inhibit-only
+}
+
+stop_inhibitor() {
+  systemctl --user stop "$INHIBIT_SERVICE" >/dev/null 2>&1 || true
+}
+
+stream_start() {
+  local original
+  load_settings
+  load_runtime_state
+  ((STREAM_ACTIVE == 0)) || return 0
+
+  original=$(current_topology)
+  if [[ "$original" == unknown ]]; then
+    printf 'Cannot start display automation from an unknown topology.\n' >&2
+    return 1
+  fi
+
+  STREAM_ACTIVE=1
+  PRE_STREAM_TOPOLOGY=$original
+  MANUAL_OVERRIDE=0
+  save_runtime_state
+  start_inhibitor
+
+  if ((AUTO_HIDE_PHYSICAL)) && ! apply_virtual_only; then
+    stop_inhibitor
+    apply_topology "$original" || true
+    STREAM_ACTIVE=0
+    PRE_STREAM_TOPOLOGY="unknown"
+    save_runtime_state
+    return 1
+  fi
+}
+
+stream_stop() {
+  load_runtime_state
+  stop_inhibitor
+  ((STREAM_ACTIVE)) || return 0
+
+  if ((MANUAL_OVERRIDE == 0)); then
+    apply_topology "$PRE_STREAM_TOPOLOGY"
+  fi
+  STREAM_ACTIVE=0
+  PRE_STREAM_TOPOLOGY="unknown"
+  MANUAL_OVERRIDE=0
+  save_runtime_state
+}
+
+set_auto_hide() {
+  load_settings
+  AUTO_HIDE_PHYSICAL=$1
+  save_settings
+}
+
+recover_physical() {
+  stop_inhibitor
+  apply_physical_only
+  STREAM_ACTIVE=0
+  PRE_STREAM_TOPOLOGY="unknown"
+  MANUAL_OVERRIDE=0
+  save_runtime_state
+}
+
+print_status_json() {
+  local topology physical=false virtual=false sunshine=false hdr=false auto=false stream=false
+  local display_state
+
+  load_settings
+  load_runtime_state
+  require_gnome_session
+  display_state=$(gdctl show --properties)
+  topology=$(current_topology "$display_state")
+  case "$topology" in
+    physical-only) physical=true ;;
+    virtual-only) virtual=true ;;
+    both) physical=true; virtual=true ;;
+  esac
+  if systemctl --user is-active --quiet "$SUNSHINE_SERVICE"; then
+    sunshine=true
+  fi
+  if $virtual &&
+    grep -E 'color-mode[^[:alpha:]].*bt2100' <<<"$display_state" >/dev/null; then
+    hdr=true
+  fi
+  if ((AUTO_HIDE_PHYSICAL)); then
+    auto=true
+  fi
+  if ((STREAM_ACTIVE)); then
+    stream=true
+  fi
+
+  printf '{"topology":"%s","physical":%s,"virtual":%s,' \
+    "$topology" "$physical" "$virtual"
+  printf '"virtual_hdr":%s,"sunshine":%s,"stream_active":%s,' \
+    "$hdr" "$sunshine" "$stream"
+  printf '"auto_hide_physical":%s,"manual_override":%s}\n' \
+    "$auto" "$([[ $MANUAL_OVERRIDE == 1 ]] && printf true || printf false)"
+}
+
+verify_configurations() {
+  require_gnome_session
+  apply_physical_only verify
+  apply_virtual_only verify
+  apply_both verify
+  printf 'All display configurations passed Mutter verification.\n'
+}
+
+load_settings
+
+case "${1:-status}" in
+  status) print_status_json ;;
+  physical-only) manual_apply physical-only ;;
+  virtual-only) manual_apply virtual-only ;;
+  both) manual_apply both ;;
+  virtual-on)
+    case "$(current_topology)" in
+      physical-only) manual_apply both ;;
+      virtual-only | both) ;;
+      *) manual_apply virtual-only ;;
+    esac
+    ;;
+  virtual-off)
+    [[ "$(current_topology)" == physical-only ]] || manual_apply physical-only
+    ;;
+  physical-on)
+    case "$(current_topology)" in
+      virtual-only) manual_apply both ;;
+      physical-only | both) ;;
+      *) manual_apply physical-only ;;
+    esac
+    ;;
+  physical-off)
+    [[ "$(current_topology)" == virtual-only ]] || manual_apply virtual-only
+    ;;
+  auto-on) set_auto_hide 1 ;;
+  auto-off) set_auto_hide 0 ;;
+  stream-start) stream_start ;;
+  stream-stop) stream_stop ;;
+  recover) recover_physical ;;
+  verify) verify_configurations ;;
+  *)
+    printf 'Usage: %s {status|physical-only|virtual-only|both|physical-on|physical-off|virtual-on|virtual-off|auto-on|auto-off|stream-start|stream-stop|recover|verify}\n' \
+      "$0" >&2
+    exit 2
+    ;;
+esac

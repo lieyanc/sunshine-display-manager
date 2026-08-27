@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ((EUID != 0)); then
+  exec sudo -- "$0" "$@"
+fi
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly EDID_SOURCE="${SCRIPT_DIR}/../edid/sunshine-4k60-hdr.bin.base64"
+readonly EDID_NAME="sunshine-4k60-hdr.bin"
+readonly EDID_RELATIVE="edid/${EDID_NAME}"
+readonly EDID_PATH="/usr/lib/firmware/${EDID_RELATIVE}"
+readonly EDID_SHA256="df1faf4bff2c4c3d7085be9351650107155465c7921417d7b8206f0810d93604"
+readonly DRACUT_CONFIG="/etc/dracut.conf.d/50-sunshine-edid.conf"
+readonly GRUB_DEFAULTS="/etc/default/grub"
+readonly KERNEL_ARGS="drm.edid_firmware=HDMI-A-1:${EDID_RELATIVE} video=HDMI-A-1:e"
+
+if ! grep -Fq "$KERNEL_ARGS" "$GRUB_DEFAULTS" &&
+  grep -Eq 'drm\.edid_firmware=|video=HDMI-A-1:' "$GRUB_DEFAULTS"; then
+  printf 'Conflicting EDID or HDMI-A-1 kernel parameters already exist in %s.\n' \
+    "$GRUB_DEFAULTS" >&2
+  exit 1
+fi
+
+tmp_edid=$(mktemp)
+trap 'rm -f "$tmp_edid"' EXIT
+base64 --decode "$EDID_SOURCE" >"$tmp_edid"
+
+if [[ $(stat --format=%s "$tmp_edid") -ne 256 ]]; then
+  printf 'EDID has an invalid size.\n' >&2
+  exit 1
+fi
+printf '%s  %s\n' "$EDID_SHA256" "$tmp_edid" | sha256sum --check --status
+
+install -d --mode=0755 "$(dirname "$EDID_PATH")"
+install --mode=0644 "$tmp_edid" "$EDID_PATH"
+install -d --mode=0755 "$(dirname "$DRACUT_CONFIG")"
+printf 'install_items+=" %s "\n' "$EDID_PATH" >"$DRACUT_CONFIG"
+chmod 0644 "$DRACUT_CONFIG"
+
+if grep -Fq "$KERNEL_ARGS" "$GRUB_DEFAULTS"; then
+  printf 'GRUB kernel parameters are already configured.\n'
+else
+  cp --archive --update=none "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.sunshine-edid.bak"
+  perl -0pi -e \
+    's/^(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*)"/$1 drm.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr.bin video=HDMI-A-1:e"/m' \
+    "$GRUB_DEFAULTS"
+  grep -Fq "$KERNEL_ARGS" "$GRUB_DEFAULTS"
+fi
+
+update-grub
+update-initramfs -u -k all
+
+current_initrd="/boot/initrd.img-$(uname -r)"
+if [[ -r "$current_initrd" ]] &&
+  ! lsinitrd "$current_initrd" "$EDID_PATH" >/dev/null; then
+  printf 'The EDID was not found in %s after rebuilding it.\n' "$current_initrd" >&2
+  exit 1
+fi
+
+printf '\nInstalled %s and configured HDMI-A-1 as a forced connector.\n' "$EDID_PATH"
+printf 'Reboot is required.\n'
