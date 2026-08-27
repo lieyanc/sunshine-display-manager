@@ -1,0 +1,16 @@
+[Unit]
+Description=Keep the Sunshine virtual connector out of the login screen
+Documentation=https://github.com/lieyanchy/sunshine-display-manager
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The connector is kernel state that outlives a session, so release it at both
+# ends: the greeter must never see the virtual display.
+ExecStart=%h/.local/bin/sunshine-displayctl detach
+ExecStop=%h/.local/bin/sunshine-displayctl detach
+
+[Install]
+WantedBy=graphical-session.target

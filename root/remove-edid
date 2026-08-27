@@ -16,11 +16,12 @@ if [[ -x "${SCRIPT_DIR}/remove-boot-entry" ]]; then
 fi
 
 # Older installations wrote the kernel arguments straight into the default
-# command line instead of a separate menu entry.
-if grep -Eq 'drm\.edid_firmware=HDMI-A-1:|video=HDMI-A-1:e' "$GRUB_DEFAULTS"; then
+# command line instead of a separate menu entry, and targeted HDMI-A-1.
+if grep -Eq 'drm\.edid_firmware=[A-Za-z0-9-]+:edid/sunshine-4k60-hdr\.bin|video=HDMI-A-1:e' \
+  "$GRUB_DEFAULTS"; then
   cp --archive "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-edid-remove"
   perl -0pi -e \
-    's/[ \t]+drm\.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
+    's/[ \t]+drm\.edid_firmware=[A-Za-z0-9-]+:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
     "$GRUB_DEFAULTS"
 fi
 
@@ -29,5 +30,5 @@ rm -f "$DRACUT_CONFIG" "$EDID_PATH"
 update-grub
 update-initramfs -u -k all
 
-printf '\nRemoved the forced HDMI-A-1 EDID override. Reboot is required.\n'
-printf 'After reboot, the HDMI port will use a physically connected display EDID again.\n'
+printf '\nRemoved the injected EDID. Reboot is required.\n'
+printf 'After reboot, every connector reads the EDID of whatever is plugged in.\n'

@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Installed as /usr/local/sbin/sunshine-boot-mode and exposed to the desktop
-# user through /etc/sudoers.d/sunshine-display-manager. It is the only piece of
-# the display manager that needs root at runtime, so it accepts a fixed set of
-# verbs and never takes a free-form argument.
+# user through /etc/sudoers.d/sunshine-display-manager. Picking a boot entry and
+# forcing a DRM connector are the only things this project needs root for at
+# runtime, so this accepts a fixed set of verbs and never takes a free-form
+# argument.
 set -euo pipefail
 
 readonly GRUB_CFG="/boot/grub/grub.cfg"
 readonly GRUB_ENV="/boot/grub/grubenv"
 readonly VIRTUAL_ID_PREFIX="sunshine-gnulinux-simple-"
-readonly DEFAULT_ID_PREFIX="gnulinux-simple-"
-readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=HDMI-A-1:"
+readonly STOCK_ID_PREFIX="gnulinux-simple-"
+readonly CONNECTOR="DP-3"
+readonly EDID_MARKER="drm.edid_firmware=${CONNECTOR}:"
 # /boot/grub is root-only and polling it through sudo would flood the audit log,
 # so the armed state is mirrored here. /run is cleared on boot, which is exactly
 # when the one-shot entry is consumed.
@@ -25,68 +27,120 @@ menu_entry_ids() {
     sed -E "s/^[^']*'//; s/'\$//"
 }
 
-virtual_entry_id() {
-  menu_entry_ids | grep -m1 "^${VIRTUAL_ID_PREFIX}" || true
+entry_id() {
+  case "$1" in
+    virtual) menu_entry_ids | grep -m1 "^${VIRTUAL_ID_PREFIX}" || true ;;
+    stock) menu_entry_ids | grep -m1 "^${STOCK_ID_PREFIX}" || true ;;
+  esac
 }
 
-default_entry_id() {
-  menu_entry_ids | grep -m1 "^${DEFAULT_ID_PREFIX}" || true
-}
-
-pending_entry() {
+grubenv_value() {
   [[ -r "$GRUB_ENV" ]] || return 0
-  grub-editenv "$GRUB_ENV" list 2>/dev/null | sed -n 's/^next_entry=//p'
+  grub-editenv "$GRUB_ENV" list 2>/dev/null | sed -n "s/^$1=//p"
+}
+
+# Maps a menu identifier back to the name this tool uses for it.
+entry_name() {
+  local id=$1
+
+  [[ -n "$id" ]] || { printf 'none\n'; return 0; }
+  if [[ "$id" == "${VIRTUAL_ID_PREFIX}"* ]]; then
+    printf 'virtual\n'
+  elif [[ "$id" == "${STOCK_ID_PREFIX}"* ]]; then
+    printf 'stock\n'
+  else
+    printf 'other\n'
+  fi
+}
+
+status_path() {
+  local path
+  for path in /sys/class/drm/card*-"${CONNECTOR}"/status; do
+    if [[ -w "$path" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+edid_injected() {
+  grep -Fq "$EDID_MARKER" /proc/cmdline
 }
 
 print_status() {
-  local booted=default pending=none virtual_id next
+  local path connector=unknown
 
-  if grep -Fq "$VIRTUAL_CMDLINE_MARKER" /proc/cmdline; then
-    booted=virtual
+  if path=$(status_path); then
+    connector=$(<"$path")
   fi
-
-  virtual_id=$(virtual_entry_id)
-  next=$(pending_entry)
-  if [[ -n "$next" ]]; then
-    if [[ -n "$virtual_id" && "$next" == "$virtual_id" ]]; then
-      pending=virtual
-    else
-      pending=other
-    fi
-  fi
-
-  printf 'booted=%s\n' "$booted"
-  printf 'pending=%s\n' "$pending"
-  printf 'entry_installed=%s\n' "$([[ -n "$virtual_id" ]] && printf yes || printf no)"
+  printf 'booted=%s\n' "$(edid_injected && printf virtual || printf stock)"
+  printf 'default=%s\n' "$(entry_name "$(grubenv_value saved_entry)")"
+  printf 'pending=%s\n' "$(entry_name "$(grubenv_value next_entry)")"
+  printf 'connector=%s\n' "$connector"
+  printf 'entry_installed=%s\n' \
+    "$([[ -n "$(entry_id virtual)" ]] && printf yes || printf no)"
 }
 
-arm_virtual() {
-  local virtual_id
-  virtual_id=$(virtual_entry_id)
-  if [[ -z "$virtual_id" ]]; then
-    printf 'No virtual display boot entry in %s. Run root/install-boot-entry first.\n' \
-      "$GRUB_CFG" >&2
+# Arming the entry that is already the saved default just clears any pending
+# one-shot, so both directions work no matter which entry is the default.
+arm_entry() {
+  local target=$1 id
+
+  id=$(entry_id "$target")
+  if [[ -z "$id" ]]; then
+    printf 'No %s boot entry in %s. Run root/install-boot-entry first.\n' \
+      "$target" "$GRUB_CFG" >&2
     return 1
   fi
-  grub-reboot "$virtual_id"
-  printf 'virtual\n' >"$PENDING_MARKER"
+  if [[ "$id" == "$(grubenv_value saved_entry)" ]]; then
+    grub-editenv "$GRUB_ENV" unset next_entry
+    rm -f "$PENDING_MARKER"
+    printf 'The %s entry is already the default; cleared any pending boot.\n' \
+      "$target"
+    return 0
+  fi
+  grub-reboot "$id"
+  printf '%s\n' "$target" >"$PENDING_MARKER"
   chmod 0644 "$PENDING_MARKER"
-  printf 'The next boot will use the virtual display entry (%s).\n' "$virtual_id"
+  printf 'The next boot will use the %s entry (%s).\n' "$target" "$id"
 }
 
-arm_default() {
+cancel_pending() {
   grub-editenv "$GRUB_ENV" unset next_entry
   rm -f "$PENDING_MARKER"
-  printf 'The next boot will use the saved default entry.\n'
+  printf 'Cleared the pending boot entry.\n'
+}
+
+# The EDID override is consumed at the first probe of the connector and the
+# kernel keeps it for the lifetime of that connector, so nothing can inject it
+# later. Refuse rather than force an output that would come up without modes.
+set_connector() {
+  local action=$1 path
+
+  if ! edid_injected; then
+    printf 'No EDID is injected for %s in this boot.\n' "$CONNECTOR" >&2
+    printf 'Reboot into the virtual display entry first.\n' >&2
+    return 1
+  fi
+  if ! path=$(status_path); then
+    printf 'No writable status attribute for %s.\n' "$CONNECTOR" >&2
+    return 1
+  fi
+  printf '%s\n' "$action" >"$path"
 }
 
 case "${1:-status}" in
   status) print_status ;;
-  arm-virtual) arm_virtual ;;
-  arm-default) arm_default ;;
+  arm-virtual) arm_entry virtual ;;
+  arm-stock) arm_entry stock ;;
+  arm-cancel) cancel_pending ;;
+  attach) set_connector on ;;
+  detach) set_connector detect ;;
   reboot) systemctl reboot ;;
   *)
-    printf 'Usage: %s {status|arm-virtual|arm-default|reboot}\n' "$0" >&2
+    printf 'Usage: %s {status|arm-virtual|arm-stock|arm-cancel|attach|detach|reboot}\n' \
+      "$0" >&2
     exit 2
     ;;
 esac

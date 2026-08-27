@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Adds a second GRUB menu entry that boots with the forced HDMI-A-1 EDID, keeps
-# the stock entry as the default, and installs the runtime helper that lets the
-# desktop user arm a one-shot boot into the virtual display mode over SSH.
+# Adds a second GRUB menu entry that injects the forged EDID on the unused DP-3
+# port, makes it the default, and installs the runtime helper that lets the desktop
+# user pick a boot entry and force the connector without a password.
 set -euo pipefail
 
 if ((EUID != 0)); then
@@ -11,7 +11,12 @@ fi
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly EDID_RELATIVE="edid/sunshine-4k60-hdr.bin"
 readonly EDID_PATH="/usr/lib/firmware/${EDID_RELATIVE}"
-readonly KERNEL_ARGS="drm.edid_firmware=HDMI-A-1:${EDID_RELATIVE} video=HDMI-A-1:e"
+# DP-3 is a permanently unused port on this machine, so dedicating it to the
+# forged EDID leaves the HDMI port free for a real display. No video=DP-3:e here
+# on purpose: the connector stays disconnected until something forces it on, so
+# the greeter never lands on the virtual display.
+readonly VIRTUAL_CONNECTOR="DP-3"
+readonly KERNEL_ARGS="drm.edid_firmware=${VIRTUAL_CONNECTOR}:${EDID_RELATIVE}"
 readonly GRUB_DEFAULTS="/etc/default/grub"
 readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
 readonly GRUB_CFG="/boot/grub/grub.cfg"
@@ -37,9 +42,10 @@ fi
 cp --archive --update=none "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-boot-entry"
 
 # The kernel arguments now live in the extra menu entry only, so the stock entry
-# boots without the virtual connector.
+# boots without the virtual connector. The patterns also cover the HDMI-A-1
+# layout that earlier versions installed.
 perl -0pi -e \
-  's/[ \t]+drm\.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
+  's/[ \t]+drm\.edid_firmware=[A-Za-z0-9-]+:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
   "$GRUB_DEFAULTS"
 
 set_grub_default() {
@@ -104,19 +110,24 @@ menu_entry_ids() {
 }
 
 virtual_id=$(menu_entry_ids | grep -m1 '^sunshine-gnulinux-simple-' || true)
-default_id=$(menu_entry_ids | grep -m1 '^gnulinux-simple-' || true)
+stock_id=$(menu_entry_ids | grep -m1 '^gnulinux-simple-' || true)
 
-if [[ -z "$virtual_id" || -z "$default_id" ]]; then
+if [[ -z "$virtual_id" || -z "$stock_id" ]]; then
   printf 'Failed to generate both boot entries in %s.\n' "$GRUB_CFG" >&2
   printf 'Identifiers found:\n' >&2
   menu_entry_ids >&2
   exit 1
 fi
 
-grub-set-default "$default_id"
+# The virtual entry is the default because the connector it injects stays
+# disconnected until a session asks for it, so it costs nothing to boot. The
+# stock entry stays in the menu for when DP-3 has to behave like a normal port.
+grub-set-default "$virtual_id"
 
 printf '\nInstalled the virtual display boot entry.\n'
-printf '  default entry: %s\n' "$default_id"
-printf '  virtual entry: %s\n' "$virtual_id"
-printf '%s can now arm a one-shot boot without a password.\n' "$target_user"
+printf '  default entry: %s\n' "$virtual_id"
+printf '  stock entry:   %s\n' "$stock_id"
+printf '  injected EDID: %s\n' "$KERNEL_ARGS"
+printf '%s can now arm a one-shot boot and force the connector without a password.\n' \
+  "$target_user"
 printf 'The running system keeps its current kernel arguments until the next reboot.\n'

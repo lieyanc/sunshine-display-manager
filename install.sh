@@ -28,6 +28,8 @@ install --mode=0755 "$REPO_DIR/indicator/sunshine-display-indicator.py" \
   "$BIN_DIR/sunshine-display-indicator"
 install --mode=0644 "$REPO_DIR/systemd/sunshine-display-indicator.service" \
   "$USER_UNIT_DIR/sunshine-display-indicator.service"
+install --mode=0644 "$REPO_DIR/systemd/sunshine-virtual-connector.service" \
+  "$USER_UNIT_DIR/sunshine-virtual-connector.service"
 
 if [[ ! -e "$SETTINGS_DIR/settings" ]]; then
   printf 'auto_hide_physical=1\n' >"$SETTINGS_DIR/settings"
@@ -59,6 +61,7 @@ rm -f "$BIN_DIR/sunshine-display-status" \
 
 systemctl --user daemon-reload
 systemctl --user enable sunshine-display-indicator.service
+systemctl --user enable sunshine-virtual-connector.service
 systemctl --user restart sunshine-display-indicator.service
 
 printf 'Installed Sunshine Display Manager.\n'

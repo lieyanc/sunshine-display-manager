@@ -2,12 +2,21 @@
 set -euo pipefail
 
 readonly PHYSICAL_CONNECTOR="DP-1"
+# Kernel connector names, used to read the real KMS state out of sysfs. Mutter
+# reports the configuration it accepted, which is not always the one the driver
+# committed, so every topology change is confirmed against these.
+readonly PHYSICAL_KERNEL_CONNECTOR="DP-1"
+readonly VIRTUAL_KERNEL_CONNECTOR="DP-3"
 readonly PHYSICAL_MODE="1920x1080@165.001"
-readonly VIRTUAL_CONNECTOR="HDMI-1"
+readonly VIRTUAL_CONNECTOR="DP-3"
 readonly VIRTUAL_MODE="3840x2160@59.997"
+# A forced DisplayPort connector has no sink to negotiate with, and the driver
+# rejects every atomic commit that asks for BT.2100 on one, at any mode. Only an
+# HDMI connector can carry the HDR metadata without a handshake.
+readonly VIRTUAL_COLOR_MODE="default"
 readonly SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
 readonly BOOT_HELPER="/usr/local/sbin/sunshine-boot-mode"
-readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=HDMI-A-1:"
+readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=DP-3:"
 readonly BOOT_PENDING_MARKER="/run/sunshine-display-boot-pending"
 readonly INHIBIT_SERVICE="sunshine-display-inhibit.service"
 
@@ -103,13 +112,13 @@ require_gnome_session() {
   fi
 }
 
-# The virtual connector only exists when the machine booted the extra GRUB
-# entry, so every virtual topology has to be gated on it.
+# The EDID can only be injected at boot, so the virtual display is available
+# exactly when the machine booted the entry that carries the kernel argument.
 boot_mode() {
   if grep -Fq "$VIRTUAL_CMDLINE_MARKER" /proc/cmdline; then
     printf 'virtual\n'
   else
-    printf 'default\n'
+    printf 'stock\n'
   fi
 }
 
@@ -121,12 +130,18 @@ boot_helper() {
 # Reads the marker the helper leaves behind instead of asking for root, so the
 # indicator can poll this every few seconds.
 boot_pending() {
-  if [[ -r "$BOOT_PENDING_MARKER" ]] &&
-    [[ "$(<"$BOOT_PENDING_MARKER")" == virtual ]]; then
-    printf 'virtual\n'
-  else
-    printf 'none\n'
+  local pending
+
+  if [[ -r "$BOOT_PENDING_MARKER" ]]; then
+    pending=$(<"$BOOT_PENDING_MARKER")
+    case "$pending" in
+      virtual | stock)
+        printf '%s\n' "$pending"
+        return 0
+        ;;
+    esac
   fi
+  printf 'none\n'
 }
 
 virtual_present() {
@@ -139,10 +154,44 @@ virtual_present() {
   grep -Fq "Monitor ${VIRTUAL_CONNECTOR} (" <<<"$state"
 }
 
+# The virtual entry leaves the connector disconnected so the greeter cannot land
+# on it. Forcing it on is what makes the virtual display appear, and Mutter needs
+# a moment to process the resulting hotplug.
+ensure_virtual_connector() {
+  local attempt
+
+  [[ "$(boot_mode)" == virtual ]] || return 1
+  # Mutter's monitor list lags the kernel by a hotplug round trip, so a stale
+  # entry must not be read as an attached connector. Drive the kernel state and
+  # then wait for both views to agree.
+  if [[ "$(connector_status "$VIRTUAL_KERNEL_CONNECTOR")" != connected ]]; then
+    boot_helper attach >/dev/null || return 1
+  fi
+  for attempt in {1..20}; do
+    if [[ "$(connector_status "$VIRTUAL_KERNEL_CONNECTOR")" == connected ]] &&
+      virtual_present; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Deliberately free of any gdctl call: this also runs while the session is being
+# torn down, when the GNOME session bus may already be gone.
+release_virtual_connector() {
+  [[ "$(boot_mode)" == virtual ]] || return 0
+  boot_helper detach >/dev/null
+}
+
 require_virtual_present() {
-  virtual_present && return 0
-  printf 'The virtual display is not available in this boot.\n' >&2
-  printf 'Reboot into the virtual display entry first: %s boot-virtual\n' "$0" >&2
+  ensure_virtual_connector && return 0
+  if [[ "$(boot_mode)" == virtual ]]; then
+    printf 'The virtual connector did not come back. Check %s.\n' "$BOOT_HELPER" >&2
+  else
+    printf 'The virtual display is not available in this boot.\n' >&2
+    printf 'Reboot into the virtual display entry first: %s boot-virtual\n' "$0" >&2
+  fi
   return 1
 }
 
@@ -176,6 +225,63 @@ current_topology() {
   fi
 }
 
+connector_enabled() {
+  local path
+  for path in /sys/class/drm/card*-"$1"/enabled; do
+    [[ -r "$path" ]] || continue
+    [[ "$(<"$path")" == enabled ]]
+    return
+  done
+  return 1
+}
+
+connector_status() {
+  local path
+  for path in /sys/class/drm/card*-"$1"/status; do
+    [[ -r "$path" ]] || continue
+    printf '%s\n' "$(<"$path")"
+    return 0
+  done
+  return 1
+}
+
+wait_for_connector() {
+  local connector=$1 want=$2 attempt
+
+  for attempt in {1..16}; do
+    if [[ "$want" == enabled ]]; then
+      connector_enabled "$connector" && return 0
+    else
+      connector_enabled "$connector" || return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+# Mutter keeps its logical view even when the driver rejects the commit, which
+# leaves the desktop and the hardware disagreeing about which output is live.
+confirm_topology() {
+  local physical virtual
+
+  case "$1" in
+    physical-only) physical=enabled virtual=disabled ;;
+    virtual-only) physical=disabled virtual=enabled ;;
+    both) physical=enabled virtual=enabled ;;
+    *) return 1 ;;
+  esac
+  if wait_for_connector "$PHYSICAL_KERNEL_CONNECTOR" "$physical" &&
+    wait_for_connector "$VIRTUAL_KERNEL_CONNECTOR" "$virtual"; then
+    return 0
+  fi
+  printf 'The driver did not apply %s: %s is %s, %s is %s.\n' "$1" \
+    "$PHYSICAL_KERNEL_CONNECTOR" \
+    "$(connector_enabled "$PHYSICAL_KERNEL_CONNECTOR" && printf enabled || printf disabled)" \
+    "$VIRTUAL_KERNEL_CONNECTOR" \
+    "$(connector_enabled "$VIRTUAL_KERNEL_CONNECTOR" && printf enabled || printf disabled)" >&2
+  return 1
+}
+
 verify_flag() {
   if [[ "${1:-}" == verify ]]; then
     printf '%s\n' '--verify'
@@ -188,16 +294,19 @@ apply_physical_only() {
   gdctl set ${verify:+"$verify"} --layout-mode logical \
     --logical-monitor --primary --scale 1 --x 0 --y 0 \
     --monitor "$PHYSICAL_CONNECTOR" --mode "$PHYSICAL_MODE" \
-    --color-mode default --rgb-range auto
+    --color-mode default --rgb-range auto || return 1
+  [[ -n "$verify" ]] || confirm_topology physical-only
 }
 
 apply_virtual_only() {
   local verify
   verify=$(verify_flag "${1:-}")
+
   gdctl set ${verify:+"$verify"} --layout-mode logical \
     --logical-monitor --primary --scale 1 --x 0 --y 0 \
     --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
-    --color-mode bt2100 --rgb-range auto
+    --color-mode "$VIRTUAL_COLOR_MODE" --rgb-range auto || return 1
+  [[ -n "$verify" ]] || confirm_topology virtual-only
 }
 
 apply_both() {
@@ -206,10 +315,11 @@ apply_both() {
   gdctl set ${verify:+"$verify"} --layout-mode logical \
     --logical-monitor --scale 1 --x 0 --y 0 \
     --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
-    --color-mode bt2100 --rgb-range auto \
+    --color-mode "$VIRTUAL_COLOR_MODE" --rgb-range auto \
     --logical-monitor --primary --scale 1 --x 552 --y 2160 \
     --monitor "$PHYSICAL_CONNECTOR" --mode "$PHYSICAL_MODE" \
-    --color-mode default --rgb-range auto
+    --color-mode default --rgb-range auto || return 1
+  [[ -n "$verify" ]] || confirm_topology both
 }
 
 apply_topology() {
@@ -240,6 +350,10 @@ mark_manual_override() {
 
 manual_apply() {
   apply_topology "$1"
+  # Nothing should be left holding a connector the topology does not use.
+  if [[ "$1" == physical-only ]]; then
+    release_virtual_connector
+  fi
   mark_manual_override
 }
 
@@ -275,7 +389,7 @@ stream_start() {
   start_inhibitor
 
   if ((AUTO_HIDE_PHYSICAL)); then
-    if ! virtual_present; then
+    if ! ensure_virtual_connector; then
       # Streaming the physical display still works, so this must not abort the
       # session that Sunshine is already setting up.
       printf 'The virtual display is not available in this boot; keeping %s.\n' \
@@ -299,6 +413,9 @@ stream_stop() {
   if ((MANUAL_OVERRIDE == 0)); then
     apply_topology "$PRE_STREAM_TOPOLOGY" || apply_physical_only
   fi
+  if [[ "$(current_topology)" == physical-only ]]; then
+    release_virtual_connector
+  fi
   STREAM_ACTIVE=0
   PRE_STREAM_TOPOLOGY="unknown"
   MANUAL_OVERRIDE=0
@@ -314,6 +431,7 @@ set_auto_hide() {
 recover_physical() {
   stop_inhibitor
   apply_physical_only
+  release_virtual_connector
   STREAM_ACTIVE=0
   PRE_STREAM_TOPOLOGY="unknown"
   MANUAL_OVERRIDE=0
@@ -325,7 +443,7 @@ boot_switch() {
 
   case "$mode" in
     virtual) verb=arm-virtual ;;
-    default) verb=arm-default ;;
+    stock) verb=arm-stock ;;
     *) return 2 ;;
   esac
   if ! boot_helper "$verb"; then
@@ -337,7 +455,7 @@ boot_switch() {
 }
 
 boot_cancel() {
-  if ! boot_helper arm-default; then
+  if ! boot_helper arm-cancel; then
     printf 'Cannot run %s. Run root/install-boot-entry to set it up.\n' \
       "$BOOT_HELPER" >&2
     return 1
@@ -350,7 +468,7 @@ sunshine_control() {
 
 print_status_json() {
   local topology physical=false virtual=false sunshine=false hdr=false auto=false stream=false
-  local display_state available=false
+  local display_state attached=false injected=false
 
   load_settings
   load_runtime_state
@@ -363,7 +481,10 @@ print_status_json() {
     both) physical=true; virtual=true ;;
   esac
   if virtual_present "$display_state"; then
-    available=true
+    attached=true
+  fi
+  if [[ "$(boot_mode)" == virtual ]]; then
+    injected=true
   fi
   if systemctl --user is-active --quiet "$SUNSHINE_SERVICE"; then
     sunshine=true
@@ -385,8 +506,9 @@ print_status_json() {
     "$hdr" "$sunshine" "$stream"
   printf '"auto_hide_physical":%s,"manual_override":%s,' \
     "$auto" "$([[ $MANUAL_OVERRIDE == 1 ]] && printf true || printf false)"
-  printf '"virtual_available":%s,"boot_mode":"%s","boot_pending":"%s"}\n' \
-    "$available" "$(boot_mode)" "$(boot_pending)"
+  printf '"virtual_injected":%s,"virtual_attached":%s,' "$injected" "$attached"
+  printf '"boot_mode":"%s","boot_pending":"%s"}\n' \
+    "$(boot_mode)" "$(boot_pending)"
 }
 
 verify_configurations() {
@@ -418,9 +540,11 @@ Displays
   recover             force the physical display back and clear session state
 
 Boot mode
-  boot-virtual        arm a one-shot virtual display boot and reboot now
-  boot-default        clear the armed boot and reboot into the stock entry now
+  boot-virtual        boot the virtual display entry next and reboot now
+  boot-stock          boot the stock entry next and reboot now
   boot-cancel         clear the armed boot without rebooting
+  attach              force the virtual connector on
+  detach              hand the virtual connector back
 
 Sunshine
   sunshine-on         start the Sunshine user service
@@ -473,8 +597,14 @@ case "${1:-status}" in
     printf 'boot_pending=%s\n' "$(boot_pending)"
     ;;
   boot-virtual) boot_switch virtual ;;
-  boot-default) boot_switch default ;;
+  boot-stock) boot_switch stock ;;
   boot-cancel) boot_cancel ;;
+  attach)
+    if [[ "$(boot_mode)" == virtual ]]; then
+      ensure_virtual_connector
+    fi
+    ;;
+  detach) release_virtual_connector ;;
   sunshine-on) sunshine_control start ;;
   sunshine-off) sunshine_control stop ;;
   sunshine-restart) sunshine_control restart ;;

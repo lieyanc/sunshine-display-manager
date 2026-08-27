@@ -6,8 +6,10 @@ readonly USER_UNIT_DIR="${HOME}/.config/systemd/user"
 readonly SUNSHINE_CONFIG="${HOME}/.config/sunshine/sunshine.conf"
 
 systemctl --user disable --now sunshine-display-indicator.service >/dev/null 2>&1 || true
+systemctl --user disable sunshine-virtual-connector.service >/dev/null 2>&1 || true
 systemctl --user stop sunshine-display-inhibit.service >/dev/null 2>&1 || true
-rm -f "$USER_UNIT_DIR/sunshine-display-indicator.service"
+rm -f "$USER_UNIT_DIR/sunshine-display-indicator.service" \
+  "$USER_UNIT_DIR/sunshine-virtual-connector.service"
 rm -f "$BIN_DIR/sunshine-displayctl" "$BIN_DIR/sunshine-display-indicator"
 # Shims from installations that predate the single entry point.
 rm -f "$BIN_DIR/sunshine-display-status" \

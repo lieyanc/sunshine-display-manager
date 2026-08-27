@@ -38,7 +38,7 @@ class Indicator:
     def __init__(self):
         self.updating = False
         self.busy = False
-        self.virtual_available = True
+        self.virtual_injected = True
         self.indicator = AppIndicator3.Indicator.new(
             "sunshine-display-manager",
             "preferences-desktop-display-symbolic",
@@ -53,7 +53,7 @@ class Indicator:
         menu.append(self.status_item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        self.virtual_item = Gtk.CheckMenuItem(label="虚拟显示器 (4K60 HDR)")
+        self.virtual_item = Gtk.CheckMenuItem(label="虚拟显示器 (DP-3, 4K60)")
         self.virtual_item.connect("toggled", self.on_virtual_toggled)
         menu.append(self.virtual_item)
 
@@ -87,13 +87,13 @@ class Indicator:
         self.boot_item.set_sensitive(False)
         menu.append(self.boot_item)
 
-        self.boot_virtual_item = Gtk.MenuItem(label="重启进入虚拟显示器模式")
+        self.boot_virtual_item = Gtk.MenuItem(label="重启到虚拟显示器条目")
         self.boot_virtual_item.connect("activate", self.on_boot_virtual)
         menu.append(self.boot_virtual_item)
 
-        self.boot_default_item = Gtk.MenuItem(label="重启回普通模式")
-        self.boot_default_item.connect("activate", self.on_boot_default)
-        menu.append(self.boot_default_item)
+        self.boot_stock_item = Gtk.MenuItem(label="重启到原版条目 (释放 DP-3)")
+        self.boot_stock_item.connect("activate", self.on_boot_stock)
+        menu.append(self.boot_stock_item)
 
         self.boot_cancel_item = Gtk.MenuItem(label="取消已排队的重启模式")
         self.boot_cancel_item.connect(
@@ -133,18 +133,19 @@ class Indicator:
 
     def on_boot_virtual(self, _item):
         if confirm(
-            "现在重启进入虚拟显示器模式？",
-            "这会立即重启主机。只有下一次启动使用虚拟显示器条目，"
-            "再往后仍然回到普通模式。",
+            "现在重启到虚拟显示器条目？",
+            "这会立即重启主机。重启后 DP-3 会带着注入的 EDID，"
+            "虚拟显示器可以随时打开。",
         ):
             self.run_controller("boot-virtual")
 
-    def on_boot_default(self, _item):
+    def on_boot_stock(self, _item):
         if confirm(
-            "现在重启回普通模式？",
-            "这会立即重启主机，重启后虚拟显示器不再存在。",
+            "现在重启到原版条目？",
+            "这会立即重启主机。重启后 DP-3 恢复普通端口行为，"
+            "在下一次重启回虚拟条目之前无法串流到虚拟显示器。",
         ):
-            self.run_controller("boot-default")
+            self.run_controller("boot-stock")
 
     def on_virtual_toggled(self, item):
         if not self.updating:
@@ -208,21 +209,19 @@ class Indicator:
             return True
 
         self.updating = True
-        self.virtual_available = state.get("virtual_available", True)
+        self.virtual_injected = state.get("virtual_injected", True)
         boot_mode = state.get("boot_mode", "virtual")
         boot_pending = state.get("boot_pending", "none")
-        self.virtual_item.set_sensitive(self.virtual_available)
-        self.both_item.set_sensitive(self.virtual_available)
-        self.virtual_only_item.set_sensitive(self.virtual_available)
-        self.physical_item.set_sensitive(self.virtual_available or not state["physical"])
+        self.virtual_item.set_sensitive(self.virtual_injected)
+        self.both_item.set_sensitive(self.virtual_injected)
+        self.virtual_only_item.set_sensitive(self.virtual_injected)
+        self.physical_item.set_sensitive(self.virtual_injected or not state["physical"])
         self.boot_item.set_label(
-            "启动模式：虚拟显示器" if boot_mode == "virtual" else "启动模式：普通"
+            "启动条目：虚拟显示器" if boot_mode == "virtual" else "启动条目：原版"
         )
-        self.boot_virtual_item.set_sensitive(
-            boot_mode == "default" and boot_pending != "virtual"
-        )
-        self.boot_default_item.set_sensitive(boot_mode == "virtual")
-        self.boot_cancel_item.set_sensitive(boot_pending == "virtual")
+        self.boot_virtual_item.set_sensitive(boot_mode != "virtual")
+        self.boot_stock_item.set_sensitive(boot_mode == "virtual")
+        self.boot_cancel_item.set_sensitive(boot_pending != "none")
         self.virtual_item.set_active(state["virtual"])
         self.physical_item.set_active(state["physical"])
         self.auto_item.set_active(state["auto_hide_physical"])
@@ -230,7 +229,7 @@ class Indicator:
         self.updating = False
 
         physical = "物理开" if state["physical"] else "物理关"
-        if not self.virtual_available:
+        if not self.virtual_injected:
             virtual = "虚拟不可用"
         elif state["virtual_hdr"]:
             virtual = "虚拟开 HDR"
@@ -239,7 +238,11 @@ class Indicator:
         else:
             virtual = "虚拟关"
         stream = " | 串流中" if state["stream_active"] else ""
-        pending = " | 下次启动：虚拟" if boot_pending == "virtual" else ""
+        pending = ""
+        if boot_pending == "virtual":
+            pending = " | 下次启动：虚拟显示器条目"
+        elif boot_pending == "stock":
+            pending = " | 下次启动：原版条目"
         self.status_item.set_label(f"{physical} | {virtual}{stream}{pending}")
 
         if state["stream_active"]:
