@@ -15,23 +15,30 @@ from gi.repository import AppIndicator3, GLib, Gtk
 
 
 CONTROLLER = os.path.expanduser("~/.local/bin/sunshine-displayctl")
-SUNSHINE_SERVICE = "app-dev.lizardbyte.app.Sunshine.service"
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 LOCK_FILE = os.path.join(RUNTIME_DIR, "sunshine-display-indicator.lock")
 
 
-def systemctl(action):
-    return subprocess.run(
-        ["systemctl", "--user", action, SUNSHINE_SERVICE],
-        capture_output=True,
-        text=True,
+def confirm(question, detail):
+    dialog = Gtk.MessageDialog(
+        transient_for=None,
+        modal=True,
+        message_type=Gtk.MessageType.QUESTION,
+        buttons=Gtk.ButtonsType.OK_CANCEL,
+        text=question,
     )
+    dialog.format_secondary_text(detail)
+    dialog.set_keep_above(True)
+    answer = dialog.run()
+    dialog.destroy()
+    return answer == Gtk.ResponseType.OK
 
 
 class Indicator:
     def __init__(self):
         self.updating = False
         self.busy = False
+        self.virtual_available = True
         self.indicator = AppIndicator3.Indicator.new(
             "sunshine-display-manager",
             "preferences-desktop-display-symbolic",
@@ -76,6 +83,25 @@ class Indicator:
         menu.append(self.physical_only_item)
         menu.append(Gtk.SeparatorMenuItem())
 
+        self.boot_item = Gtk.MenuItem(label="启动模式")
+        self.boot_item.set_sensitive(False)
+        menu.append(self.boot_item)
+
+        self.boot_virtual_item = Gtk.MenuItem(label="重启进入虚拟显示器模式")
+        self.boot_virtual_item.connect("activate", self.on_boot_virtual)
+        menu.append(self.boot_virtual_item)
+
+        self.boot_default_item = Gtk.MenuItem(label="重启回普通模式")
+        self.boot_default_item.connect("activate", self.on_boot_default)
+        menu.append(self.boot_default_item)
+
+        self.boot_cancel_item = Gtk.MenuItem(label="取消已排队的重启模式")
+        self.boot_cancel_item.connect(
+            "activate", lambda _item: self.run_controller("boot-cancel")
+        )
+        menu.append(self.boot_cancel_item)
+        menu.append(Gtk.SeparatorMenuItem())
+
         self.sunshine_item = Gtk.CheckMenuItem(label="Sunshine 服务")
         self.sunshine_item.connect("toggled", self.on_sunshine_toggled)
         menu.append(self.sunshine_item)
@@ -105,6 +131,21 @@ class Indicator:
         self.refresh()
         GLib.timeout_add_seconds(5, self.refresh)
 
+    def on_boot_virtual(self, _item):
+        if confirm(
+            "现在重启进入虚拟显示器模式？",
+            "这会立即重启主机。只有下一次启动使用虚拟显示器条目，"
+            "再往后仍然回到普通模式。",
+        ):
+            self.run_controller("boot-virtual")
+
+    def on_boot_default(self, _item):
+        if confirm(
+            "现在重启回普通模式？",
+            "这会立即重启主机，重启后虚拟显示器不再存在。",
+        ):
+            self.run_controller("boot-default")
+
     def on_virtual_toggled(self, item):
         if not self.updating:
             self.run_controller("virtual-on" if item.get_active() else "virtual-off")
@@ -120,9 +161,7 @@ class Indicator:
     def on_sunshine_toggled(self, item):
         if self.updating:
             return
-        self.run_background(
-            lambda: systemctl("start" if item.get_active() else "stop")
-        )
+        self.run_controller("sunshine-on" if item.get_active() else "sunshine-off")
 
     def run_controller(self, command):
         self.run_background(
@@ -169,6 +208,21 @@ class Indicator:
             return True
 
         self.updating = True
+        self.virtual_available = state.get("virtual_available", True)
+        boot_mode = state.get("boot_mode", "virtual")
+        boot_pending = state.get("boot_pending", "none")
+        self.virtual_item.set_sensitive(self.virtual_available)
+        self.both_item.set_sensitive(self.virtual_available)
+        self.virtual_only_item.set_sensitive(self.virtual_available)
+        self.physical_item.set_sensitive(self.virtual_available or not state["physical"])
+        self.boot_item.set_label(
+            "启动模式：虚拟显示器" if boot_mode == "virtual" else "启动模式：普通"
+        )
+        self.boot_virtual_item.set_sensitive(
+            boot_mode == "default" and boot_pending != "virtual"
+        )
+        self.boot_default_item.set_sensitive(boot_mode == "virtual")
+        self.boot_cancel_item.set_sensitive(boot_pending == "virtual")
         self.virtual_item.set_active(state["virtual"])
         self.physical_item.set_active(state["physical"])
         self.auto_item.set_active(state["auto_hide_physical"])
@@ -176,11 +230,17 @@ class Indicator:
         self.updating = False
 
         physical = "物理开" if state["physical"] else "物理关"
-        virtual = "虚拟开 HDR" if state["virtual_hdr"] else (
-            "虚拟开" if state["virtual"] else "虚拟关"
-        )
+        if not self.virtual_available:
+            virtual = "虚拟不可用"
+        elif state["virtual_hdr"]:
+            virtual = "虚拟开 HDR"
+        elif state["virtual"]:
+            virtual = "虚拟开"
+        else:
+            virtual = "虚拟关"
         stream = " | 串流中" if state["stream_active"] else ""
-        self.status_item.set_label(f"{physical} | {virtual}{stream}")
+        pending = " | 下次启动：虚拟" if boot_pending == "virtual" else ""
+        self.status_item.set_label(f"{physical} | {virtual}{stream}{pending}")
 
         if state["stream_active"]:
             icon = "network-transmit-receive-symbolic"

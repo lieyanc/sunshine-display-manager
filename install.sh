@@ -26,16 +26,6 @@ install --mode=0755 "$REPO_DIR/bin/sunshine-displayctl" \
   "$BIN_DIR/sunshine-displayctl"
 install --mode=0755 "$REPO_DIR/indicator/sunshine-display-indicator.py" \
   "$BIN_DIR/sunshine-display-indicator"
-install --mode=0755 "$REPO_DIR/ssh/display-status" \
-  "$BIN_DIR/sunshine-display-status"
-install --mode=0755 "$REPO_DIR/ssh/recover-physical" \
-  "$BIN_DIR/sunshine-display-recover"
-install --mode=0755 "$REPO_DIR/ssh/physical-only" \
-  "$BIN_DIR/sunshine-display-physical-only"
-install --mode=0755 "$REPO_DIR/ssh/virtual-only" \
-  "$BIN_DIR/sunshine-display-virtual-only"
-install --mode=0755 "$REPO_DIR/ssh/both-displays" \
-  "$BIN_DIR/sunshine-display-both"
 install --mode=0644 "$REPO_DIR/systemd/sunshine-display-indicator.service" \
   "$USER_UNIT_DIR/sunshine-display-indicator.service"
 
@@ -54,13 +44,30 @@ python3 "$REPO_DIR/migrations/clean-sunshine-apps.py" "$SUNSHINE_APPS"
 
 rm -f "$USER_UNIT_DIR/app-dev.lizardbyte.app.Sunshine.service.d/display.conf"
 rm -f "$BIN_DIR/sunshine-display"
+# Every action moved into the single sunshine-displayctl entry point.
+rm -f "$BIN_DIR/sunshine-display-status" \
+  "$BIN_DIR/sunshine-display-recover" \
+  "$BIN_DIR/sunshine-display-physical-only" \
+  "$BIN_DIR/sunshine-display-virtual-only" \
+  "$BIN_DIR/sunshine-display-both" \
+  "$BIN_DIR/sunshine-display-boot-status" \
+  "$BIN_DIR/sunshine-display-boot-virtual" \
+  "$BIN_DIR/sunshine-display-boot-default" \
+  "$BIN_DIR/sunshine-display-boot-cancel" \
+  "$BIN_DIR/sunshine-display-sunshine-on" \
+  "$BIN_DIR/sunshine-display-sunshine-off"
 
 systemctl --user daemon-reload
 systemctl --user enable sunshine-display-indicator.service
 systemctl --user restart sunshine-display-indicator.service
 
 printf 'Installed Sunshine Display Manager.\n'
-printf 'Run %s status to inspect the current topology.\n' "$BIN_DIR/sunshine-displayctl"
+printf 'Run %s help for the full command list.\n' "$BIN_DIR/sunshine-displayctl"
+
+if [[ ! -x /usr/local/sbin/sunshine-boot-mode ]]; then
+  printf '\nThe boot mode helper is missing, so the virtual display cannot be\n'
+  printf 'armed from a menu or over SSH. Run %s/root/install-boot-entry.\n' "$REPO_DIR"
+fi
 
 gdm_home=$(getent passwd gdm | cut -d: -f6) || gdm_home=""
 if [[ -n "$gdm_home" && ! -e "${gdm_home}/.config/monitors.xml" ]]; then

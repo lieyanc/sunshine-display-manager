@@ -5,14 +5,25 @@ if ((EUID != 0)); then
   exec sudo -- "$0" "$@"
 fi
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly EDID_PATH="/usr/lib/firmware/edid/sunshine-4k60-hdr.bin"
 readonly DRACUT_CONFIG="/etc/dracut.conf.d/50-sunshine-edid.conf"
 readonly GRUB_DEFAULTS="/etc/default/grub"
 
-cp --archive "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-edid-remove"
-perl -0pi -e \
-  's/[ \t]+drm\.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
-  "$GRUB_DEFAULTS"
+# The extra boot entry is useless without the firmware, so drop it first.
+if [[ -x "${SCRIPT_DIR}/remove-boot-entry" ]]; then
+  "${SCRIPT_DIR}/remove-boot-entry"
+fi
+
+# Older installations wrote the kernel arguments straight into the default
+# command line instead of a separate menu entry.
+if grep -Eq 'drm\.edid_firmware=HDMI-A-1:|video=HDMI-A-1:e' "$GRUB_DEFAULTS"; then
+  cp --archive "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-edid-remove"
+  perl -0pi -e \
+    's/[ \t]+drm\.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
+    "$GRUB_DEFAULTS"
+fi
+
 rm -f "$DRACUT_CONFIG" "$EDID_PATH"
 
 update-grub

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Installed as /usr/local/sbin/sunshine-boot-mode and exposed to the desktop
+# user through /etc/sudoers.d/sunshine-display-manager. It is the only piece of
+# the display manager that needs root at runtime, so it accepts a fixed set of
+# verbs and never takes a free-form argument.
+set -euo pipefail
+
+readonly GRUB_CFG="/boot/grub/grub.cfg"
+readonly GRUB_ENV="/boot/grub/grubenv"
+readonly VIRTUAL_ID_PREFIX="sunshine-gnulinux-simple-"
+readonly DEFAULT_ID_PREFIX="gnulinux-simple-"
+readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=HDMI-A-1:"
+# /boot/grub is root-only and polling it through sudo would flood the audit log,
+# so the armed state is mirrored here. /run is cleared on boot, which is exactly
+# when the one-shot entry is consumed.
+readonly PENDING_MARKER="/run/sunshine-display-boot-pending"
+
+if ((EUID != 0)); then
+  printf 'sunshine-boot-mode must run as root.\n' >&2
+  exit 1
+fi
+
+menu_entry_ids() {
+  grep -oE -- "(--id|[\$]menuentry_id_option) '[^']*'" "$GRUB_CFG" |
+    sed -E "s/^[^']*'//; s/'\$//"
+}
+
+virtual_entry_id() {
+  menu_entry_ids | grep -m1 "^${VIRTUAL_ID_PREFIX}" || true
+}
+
+default_entry_id() {
+  menu_entry_ids | grep -m1 "^${DEFAULT_ID_PREFIX}" || true
+}
+
+pending_entry() {
+  [[ -r "$GRUB_ENV" ]] || return 0
+  grub-editenv "$GRUB_ENV" list 2>/dev/null | sed -n 's/^next_entry=//p'
+}
+
+print_status() {
+  local booted=default pending=none virtual_id next
+
+  if grep -Fq "$VIRTUAL_CMDLINE_MARKER" /proc/cmdline; then
+    booted=virtual
+  fi
+
+  virtual_id=$(virtual_entry_id)
+  next=$(pending_entry)
+  if [[ -n "$next" ]]; then
+    if [[ -n "$virtual_id" && "$next" == "$virtual_id" ]]; then
+      pending=virtual
+    else
+      pending=other
+    fi
+  fi
+
+  printf 'booted=%s\n' "$booted"
+  printf 'pending=%s\n' "$pending"
+  printf 'entry_installed=%s\n' "$([[ -n "$virtual_id" ]] && printf yes || printf no)"
+}
+
+arm_virtual() {
+  local virtual_id
+  virtual_id=$(virtual_entry_id)
+  if [[ -z "$virtual_id" ]]; then
+    printf 'No virtual display boot entry in %s. Run root/install-boot-entry first.\n' \
+      "$GRUB_CFG" >&2
+    return 1
+  fi
+  grub-reboot "$virtual_id"
+  printf 'virtual\n' >"$PENDING_MARKER"
+  chmod 0644 "$PENDING_MARKER"
+  printf 'The next boot will use the virtual display entry (%s).\n' "$virtual_id"
+}
+
+arm_default() {
+  grub-editenv "$GRUB_ENV" unset next_entry
+  rm -f "$PENDING_MARKER"
+  printf 'The next boot will use the saved default entry.\n'
+}
+
+case "${1:-status}" in
+  status) print_status ;;
+  arm-virtual) arm_virtual ;;
+  arm-default) arm_default ;;
+  reboot) systemctl reboot ;;
+  *)
+    printf 'Usage: %s {status|arm-virtual|arm-default|reboot}\n' "$0" >&2
+    exit 2
+    ;;
+esac

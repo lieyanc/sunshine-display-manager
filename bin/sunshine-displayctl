@@ -6,6 +6,9 @@ readonly PHYSICAL_MODE="1920x1080@165.001"
 readonly VIRTUAL_CONNECTOR="HDMI-1"
 readonly VIRTUAL_MODE="3840x2160@59.997"
 readonly SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
+readonly BOOT_HELPER="/usr/local/sbin/sunshine-boot-mode"
+readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=HDMI-A-1:"
+readonly BOOT_PENDING_MARKER="/run/sunshine-display-boot-pending"
 readonly INHIBIT_SERVICE="sunshine-display-inhibit.service"
 
 uid=$(id -u)
@@ -100,6 +103,49 @@ require_gnome_session() {
   fi
 }
 
+# The virtual connector only exists when the machine booted the extra GRUB
+# entry, so every virtual topology has to be gated on it.
+boot_mode() {
+  if grep -Fq "$VIRTUAL_CMDLINE_MARKER" /proc/cmdline; then
+    printf 'virtual\n'
+  else
+    printf 'default\n'
+  fi
+}
+
+boot_helper() {
+  [[ -x "$BOOT_HELPER" ]] || return 1
+  sudo -n "$BOOT_HELPER" "$@"
+}
+
+# Reads the marker the helper leaves behind instead of asking for root, so the
+# indicator can poll this every few seconds.
+boot_pending() {
+  if [[ -r "$BOOT_PENDING_MARKER" ]] &&
+    [[ "$(<"$BOOT_PENDING_MARKER")" == virtual ]]; then
+    printf 'virtual\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+virtual_present() {
+  local state="${1:-}"
+
+  if [[ -z "$state" ]]; then
+    require_gnome_session
+    state=$(gdctl show --properties)
+  fi
+  grep -Fq "Monitor ${VIRTUAL_CONNECTOR} (" <<<"$state"
+}
+
+require_virtual_present() {
+  virtual_present && return 0
+  printf 'The virtual display is not available in this boot.\n' >&2
+  printf 'Reboot into the virtual display entry first: %s boot-virtual\n' "$0" >&2
+  return 1
+}
+
 current_topology() {
   local state="${1:-}" logical physical=false virtual=false
 
@@ -169,8 +215,14 @@ apply_both() {
 apply_topology() {
   case "$1" in
     physical-only) apply_physical_only ;;
-    virtual-only) apply_virtual_only ;;
-    both) apply_both ;;
+    virtual-only)
+      require_virtual_present
+      apply_virtual_only
+      ;;
+    both)
+      require_virtual_present
+      apply_both
+      ;;
     *)
       printf 'Cannot apply unknown display topology: %s\n' "$1" >&2
       return 1
@@ -222,13 +274,20 @@ stream_start() {
   save_runtime_state
   start_inhibitor
 
-  if ((AUTO_HIDE_PHYSICAL)) && ! apply_virtual_only; then
-    stop_inhibitor
-    apply_topology "$original" || true
-    STREAM_ACTIVE=0
-    PRE_STREAM_TOPOLOGY="unknown"
-    save_runtime_state
-    return 1
+  if ((AUTO_HIDE_PHYSICAL)); then
+    if ! virtual_present; then
+      # Streaming the physical display still works, so this must not abort the
+      # session that Sunshine is already setting up.
+      printf 'The virtual display is not available in this boot; keeping %s.\n' \
+        "$original" >&2
+    elif ! apply_virtual_only; then
+      stop_inhibitor
+      apply_topology "$original" || true
+      STREAM_ACTIVE=0
+      PRE_STREAM_TOPOLOGY="unknown"
+      save_runtime_state
+      return 1
+    fi
   fi
 }
 
@@ -238,7 +297,7 @@ stream_stop() {
   ((STREAM_ACTIVE)) || return 0
 
   if ((MANUAL_OVERRIDE == 0)); then
-    apply_topology "$PRE_STREAM_TOPOLOGY"
+    apply_topology "$PRE_STREAM_TOPOLOGY" || apply_physical_only
   fi
   STREAM_ACTIVE=0
   PRE_STREAM_TOPOLOGY="unknown"
@@ -261,9 +320,37 @@ recover_physical() {
   save_runtime_state
 }
 
+boot_switch() {
+  local mode=$1 verb
+
+  case "$mode" in
+    virtual) verb=arm-virtual ;;
+    default) verb=arm-default ;;
+    *) return 2 ;;
+  esac
+  if ! boot_helper "$verb"; then
+    printf 'Cannot run %s. Run root/install-boot-entry to set it up.\n' \
+      "$BOOT_HELPER" >&2
+    return 1
+  fi
+  boot_helper reboot
+}
+
+boot_cancel() {
+  if ! boot_helper arm-default; then
+    printf 'Cannot run %s. Run root/install-boot-entry to set it up.\n' \
+      "$BOOT_HELPER" >&2
+    return 1
+  fi
+}
+
+sunshine_control() {
+  systemctl --user "$1" "$SUNSHINE_SERVICE"
+}
+
 print_status_json() {
   local topology physical=false virtual=false sunshine=false hdr=false auto=false stream=false
-  local display_state
+  local display_state available=false
 
   load_settings
   load_runtime_state
@@ -275,6 +362,9 @@ print_status_json() {
     virtual-only) virtual=true ;;
     both) physical=true; virtual=true ;;
   esac
+  if virtual_present "$display_state"; then
+    available=true
+  fi
   if systemctl --user is-active --quiet "$SUNSHINE_SERVICE"; then
     sunshine=true
   fi
@@ -293,16 +383,56 @@ print_status_json() {
     "$topology" "$physical" "$virtual"
   printf '"virtual_hdr":%s,"sunshine":%s,"stream_active":%s,' \
     "$hdr" "$sunshine" "$stream"
-  printf '"auto_hide_physical":%s,"manual_override":%s}\n' \
+  printf '"auto_hide_physical":%s,"manual_override":%s,' \
     "$auto" "$([[ $MANUAL_OVERRIDE == 1 ]] && printf true || printf false)"
+  printf '"virtual_available":%s,"boot_mode":"%s","boot_pending":"%s"}\n' \
+    "$available" "$(boot_mode)" "$(boot_pending)"
 }
 
 verify_configurations() {
   require_gnome_session
+  require_virtual_present
   apply_physical_only verify
   apply_virtual_only verify
   apply_both verify
   printf 'All display configurations passed Mutter verification.\n'
+}
+
+print_usage() {
+  cat <<USAGE
+Usage: ${0##*/} <command>
+
+Status
+  status              current topology, boot mode and settings as JSON
+  boot-status         current boot mode and the armed next boot
+  verify              ask Mutter to validate every topology
+
+Displays
+  physical-only       switch to the physical display alone
+  virtual-only        switch to the virtual display alone
+  both                switch to the dual display layout
+  physical-on         keep the physical display on, adding it if needed
+  physical-off        turn the physical display off, keeping the virtual one
+  virtual-on          keep the virtual display on, adding it if needed
+  virtual-off         turn the virtual display off, keeping the physical one
+  recover             force the physical display back and clear session state
+
+Boot mode
+  boot-virtual        arm a one-shot virtual display boot and reboot now
+  boot-default        clear the armed boot and reboot into the stock entry now
+  boot-cancel         clear the armed boot without rebooting
+
+Sunshine
+  sunshine-on         start the Sunshine user service
+  sunshine-off        stop the Sunshine user service
+  sunshine-restart    restart the Sunshine user service
+
+Automation
+  auto-on             hide the physical display while streaming
+  auto-off            keep the topology unchanged while streaming
+  stream-start        Sunshine session hook, not meant to be run by hand
+  stream-stop         Sunshine session hook, not meant to be run by hand
+USAGE
 }
 
 load_settings
@@ -338,9 +468,20 @@ case "${1:-status}" in
   stream-stop) stream_stop ;;
   recover) recover_physical ;;
   verify) verify_configurations ;;
+  boot-status)
+    printf 'boot_mode=%s\n' "$(boot_mode)"
+    printf 'boot_pending=%s\n' "$(boot_pending)"
+    ;;
+  boot-virtual) boot_switch virtual ;;
+  boot-default) boot_switch default ;;
+  boot-cancel) boot_cancel ;;
+  sunshine-on) sunshine_control start ;;
+  sunshine-off) sunshine_control stop ;;
+  sunshine-restart) sunshine_control restart ;;
+  help | --help | -h) print_usage ;;
   *)
-    printf 'Usage: %s {status|physical-only|virtual-only|both|physical-on|physical-off|virtual-on|virtual-off|auto-on|auto-off|stream-start|stream-stop|recover|verify}\n' \
-      "$0" >&2
+    printf 'Unknown command: %s\n\n' "$1" >&2
+    print_usage >&2
     exit 2
     ;;
 esac

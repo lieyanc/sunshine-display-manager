@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Adds a second GRUB menu entry that boots with the forced HDMI-A-1 EDID, keeps
+# the stock entry as the default, and installs the runtime helper that lets the
+# desktop user arm a one-shot boot into the virtual display mode over SSH.
+set -euo pipefail
+
+if ((EUID != 0)); then
+  exec sudo -- "$0" "$@"
+fi
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly EDID_RELATIVE="edid/sunshine-4k60-hdr.bin"
+readonly EDID_PATH="/usr/lib/firmware/${EDID_RELATIVE}"
+readonly KERNEL_ARGS="drm.edid_firmware=HDMI-A-1:${EDID_RELATIVE} video=HDMI-A-1:e"
+readonly GRUB_DEFAULTS="/etc/default/grub"
+readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
+readonly GRUB_CFG="/boot/grub/grub.cfg"
+readonly HELPER_SOURCE="${SCRIPT_DIR}/sunshine-boot-mode"
+readonly HELPER_PATH="/usr/local/sbin/sunshine-boot-mode"
+readonly SUDOERS_PATH="/etc/sudoers.d/sunshine-display-manager"
+
+target_user=${1:-${SUDO_USER:-}}
+if [[ -z "$target_user" ]] || ! id -u "$target_user" >/dev/null 2>&1; then
+  printf 'Cannot determine the desktop user. Pass it as the first argument.\n' >&2
+  exit 1
+fi
+
+if [[ ! -r "$EDID_PATH" ]]; then
+  printf '%s is missing. Run root/install-edid first.\n' "$EDID_PATH" >&2
+  exit 1
+fi
+if [[ ! -r /etc/grub.d/10_linux ]]; then
+  printf '/etc/grub.d/10_linux is missing. Is this a GRUB system?\n' >&2
+  exit 1
+fi
+
+cp --archive --update=none "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-boot-entry"
+
+# The kernel arguments now live in the extra menu entry only, so the stock entry
+# boots without the virtual connector.
+perl -0pi -e \
+  's/[ \t]+drm\.edid_firmware=HDMI-A-1:edid\/sunshine-4k60-hdr\.bin//g; s/[ \t]+video=HDMI-A-1:e//g' \
+  "$GRUB_DEFAULTS"
+
+set_grub_default() {
+  local key=$1 value=$2
+  KEY="$key" VALUE="$value" perl -0777pi -e '
+    $key = quotemeta($ENV{"KEY"});
+    if (!s/^[ \t]*#?[ \t]*$key=.*$/$ENV{"KEY"} . "=" . $ENV{"VALUE"}/me) {
+      $_ .= "\n" if length($_) && $_ !~ /\n\z/;
+      $_ .= "$ENV{KEY}=$ENV{VALUE}\n";
+    }
+  ' "$GRUB_DEFAULTS"
+}
+
+# grub-reboot only works when the default entry is the saved one, and
+# GRUB_SAVEDEFAULT must stay off so a one-shot boot never becomes permanent.
+set_grub_default GRUB_DEFAULT saved
+set_grub_default GRUB_SAVEDEFAULT false
+# An unset saved entry would leave the generated config with an empty default,
+# so seed it before regenerating and refine it to a stable identifier below.
+grub-set-default 0
+set_grub_default GRUB_TIMEOUT_STYLE menu
+if grep -Eq '^[ \t]*GRUB_TIMEOUT=0[ \t]*$' "$GRUB_DEFAULTS"; then
+  set_grub_default GRUB_TIMEOUT 5
+fi
+
+# Re-runs the stock linux entry generator with the extra kernel arguments and a
+# different title, so kernel upgrades keep both entries in sync. Every generated
+# menu identifier is prefixed to keep it distinct from the stock entries.
+cat >"$GRUB_SCRIPT" <<EOF
+#!/bin/sh
+set -e
+
+[ -r "${EDID_PATH}" ] || exit 0
+
+GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} ${KERNEL_ARGS}"
+GRUB_DISTRIBUTOR="\${GRUB_DISTRIBUTOR} (virtual display)"
+GRUB_DISABLE_RECOVERY=true
+export GRUB_CMDLINE_LINUX_DEFAULT GRUB_DISTRIBUTOR GRUB_DISABLE_RECOVERY
+
+entries=\$(. /etc/grub.d/10_linux)
+[ -n "\$entries" ] || exit 0
+# grub.cfg carries the identifier behind \$menuentry_id_option rather than a
+# literal --id, so both spellings have to be prefixed.
+printf '%s\n' "\$entries" |
+  sed -E "s/(--id|[\$]menuentry_id_option) '/\\1 'sunshine-/g"
+EOF
+chmod 0755 "$GRUB_SCRIPT"
+
+install --mode=0755 --owner=root --group=root "$HELPER_SOURCE" "$HELPER_PATH"
+
+tmp_sudoers=$(mktemp)
+trap 'rm -f "$tmp_sudoers"' EXIT
+printf '%s ALL=(root) NOPASSWD: %s\n' "$target_user" "$HELPER_PATH" >"$tmp_sudoers"
+visudo --check --file="$tmp_sudoers" >/dev/null
+install --mode=0440 --owner=root --group=root "$tmp_sudoers" "$SUDOERS_PATH"
+
+update-grub
+
+menu_entry_ids() {
+  grep -oE -- "(--id|[\$]menuentry_id_option) '[^']*'" "$GRUB_CFG" |
+    sed -E "s/^[^']*'//; s/'\$//"
+}
+
+virtual_id=$(menu_entry_ids | grep -m1 '^sunshine-gnulinux-simple-' || true)
+default_id=$(menu_entry_ids | grep -m1 '^gnulinux-simple-' || true)
+
+if [[ -z "$virtual_id" || -z "$default_id" ]]; then
+  printf 'Failed to generate both boot entries in %s.\n' "$GRUB_CFG" >&2
+  printf 'Identifiers found:\n' >&2
+  menu_entry_ids >&2
+  exit 1
+fi
+
+grub-set-default "$default_id"
+
+printf '\nInstalled the virtual display boot entry.\n'
+printf '  default entry: %s\n' "$default_id"
+printf '  virtual entry: %s\n' "$virtual_id"
+printf '%s can now arm a one-shot boot without a password.\n' "$target_user"
+printf 'The running system keeps its current kernel arguments until the next reboot.\n'

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Removes the extra GRUB entry and the runtime boot mode helper. The EDID
+# firmware stays installed; use root/remove-edid to drop that as well.
+set -euo pipefail
+
+if ((EUID != 0)); then
+  exec sudo -- "$0" "$@"
+fi
+
+readonly GRUB_DEFAULTS="/etc/default/grub"
+readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
+readonly GRUB_ENV="/boot/grub/grubenv"
+readonly HELPER_PATH="/usr/local/sbin/sunshine-boot-mode"
+readonly SUDOERS_PATH="/etc/sudoers.d/sunshine-display-manager"
+
+grub-editenv "$GRUB_ENV" unset next_entry || true
+rm -f "$GRUB_SCRIPT" "$HELPER_PATH" "$SUDOERS_PATH"
+
+# A saved default that points at a removed entry would leave GRUB without a
+# usable default, so restore the plain first-entry behaviour.
+cp --archive "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-boot-entry-remove"
+perl -0777pi -e 's/^[ \t]*GRUB_DEFAULT=saved[ \t]*$/GRUB_DEFAULT=0/m' "$GRUB_DEFAULTS"
+grub-editenv "$GRUB_ENV" unset saved_entry || true
+
+update-grub
+
+printf '\nRemoved the virtual display boot entry and the boot mode helper.\n'
+printf 'The system now always boots without the virtual connector.\n'
