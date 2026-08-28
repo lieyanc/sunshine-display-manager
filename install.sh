@@ -75,9 +75,13 @@ elif [[ ! -x /usr/local/sbin/sunshine-display-port ]]; then
   printf 'between DP-3 and HDMI. Re-run %s/root/install-boot-entry.\n' "$REPO_DIR"
 fi
 
+# The greeter needs no configuration: the virtual connector stays disconnected
+# until a session forces it on. Earlier versions wrote a monitors.xml instead,
+# which since GDM 50 is never read because the greeter home is rebuilt on tmpfs
+# every boot, so anything left behind is dead weight.
 gdm_home=$(getent passwd gdm | cut -d: -f6) || gdm_home=""
-if [[ -n "$gdm_home" && ! -e "${gdm_home}/.config/monitors.xml" ]]; then
-  printf '\nThe login screen has no display configuration, so the greeter lights up\n'
-  printf 'the virtual display too. Run %s/root/install-greeter-config to fix it.\n' \
-    "$REPO_DIR"
+if [[ -n "$gdm_home" && -e "${gdm_home}/.config/monitors.xml" ]]; then
+  printf '\nA greeter display configuration from an earlier version is still in\n'
+  printf 'place and no longer does anything. Remove it with\n'
+  printf '%s/root/remove-greeter-config.\n' "$REPO_DIR"
 fi
