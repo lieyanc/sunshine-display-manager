@@ -80,12 +80,16 @@ booted_port_connector() {
 
 # What the boot entry will inject next time. Root owns the file but everyone can
 # read it, so the indicator can show a queued switch without asking for a password.
+# The generated GRUB entry sources this file, so read it the same way: a parser of
+# its own would eventually report a port other than the one that gets booted.
 configured_port_connector() {
   local value=""
 
   if [[ -r "$PORT_CONFIG" ]]; then
-    value=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" | tail -n1)
-    value=${value//[\"\'[:space:]]/}
+    value=$(
+      . "$PORT_CONFIG" >/dev/null 2>&1 || exit 1
+      printf '%s\n' "${SUNSHINE_VIRTUAL_CONNECTOR-}"
+    ) || value=""
   fi
   if [[ "$(port_name "$value")" == unknown ]]; then
     value=$DEFAULT_PORT_CONNECTOR
@@ -501,9 +505,20 @@ boot_cancel() {
 # GRUB entry, which is deliberately kept out of the passwordless sudoers rule: it
 # is a rare, deliberate action, so it authenticates every time.
 run_as_root() {
-  if [[ -t 0 ]]; then
+  local has_pkexec=0
+
+  if command -v pkexec >/dev/null 2>&1; then
+    has_pkexec=1
+  fi
+  # Prefer the polkit dialog whenever a graphical session can show one, even when
+  # this was started from a terminal. The indicator runs the controller on a
+  # background thread with its output captured, where a sudo tty prompt would
+  # block out of sight and leave the menu stuck on "applying".
+  if ((has_pkexec)) && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+    pkexec "$@"
+  elif [[ -t 0 ]]; then
     sudo -- "$@"
-  elif command -v pkexec >/dev/null 2>&1; then
+  elif ((has_pkexec)); then
     pkexec "$@"
   else
     printf 'No terminal to ask for a password on and pkexec is unavailable.\n' >&2
@@ -528,7 +543,13 @@ port_switch() {
   run_as_root "$PORT_HELPER" "$target" || return 1
   # The running kernel keeps the port it was booted with, so the switch is only
   # real after a reboot into the virtual entry the helper just made the default.
-  boot_helper reboot
+  # The helper has already committed it, so a reboot this tool cannot trigger is
+  # an inconvenience, not a failed switch: say so rather than report an error.
+  if ! boot_helper reboot; then
+    printf 'The virtual display will use %s after the next reboot, but %s could\n' \
+      "$connector" "$BOOT_HELPER"
+    printf 'not trigger one. Reboot by hand.\n'
+  fi
 }
 
 port_status() {
@@ -654,9 +675,9 @@ Sunshine
 
 Automation
   auto-on             hide the physical display while streaming
-  auto-off            keep the topology unchanged while streaming
+  auto-off            do not switch to virtual-only when a stream starts
   stream-start        Sunshine session hook, not meant to be run by hand
-  stream-stop         Sunshine session hook, not meant to be run by hand
+  stream-stop         the same; always lands back on physical-only
 USAGE
 }
 

@@ -46,12 +46,17 @@ booted_connector() {
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
+# The generated GRUB entry sources this file, so read it the same way rather than
+# parsing it: anything the two readers disagree about would make this tool report
+# a port other than the one that gets booted.
 configured_connector() {
   local value=""
 
   if [[ -r "$PORT_CONFIG" ]]; then
-    value=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" | tail -n1)
-    value=${value//[\"\'[:space:]]/}
+    value=$(
+      . "$PORT_CONFIG" >/dev/null 2>&1 || exit 1
+      printf '%s\n' "${SUNSHINE_VIRTUAL_CONNECTOR-}"
+    ) || value=""
   fi
   if [[ "$(port_name "$value")" == unknown ]]; then
     value=$DEFAULT_CONNECTOR

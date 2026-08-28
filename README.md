@@ -70,11 +70,14 @@ with, which is why the switch reboots.
   A rejected commit is an error, not a silent half-applied state.
 - When Moonlight launches an app, Sunshine's `global_prep_cmd` attaches the
   virtual display, switches to virtual-only, and inhibits idle and suspend.
+  Turning off "hide the physical display while streaming" skips the switch, but
+  not the inhibitor.
 - When the Sunshine app session ends, the topology always returns to
   physical-only and the connector is handed back — including when the stream
-  started from a dual layout. Restoring a dual layout would leave the virtual
-  display sitting in Mutter after the stream, and the point of the forced
-  connector is that it exists only while something is streaming to it.
+  started from a dual layout, and including when the switch was skipped.
+  Restoring a dual layout would leave the virtual display sitting in Mutter
+  after the stream, and the point of the forced connector is that it exists only
+  while something is streaming to it.
 - The menu items that turn the virtual display on by hand are still there for
   testing; they are the only way it appears outside a stream.
 

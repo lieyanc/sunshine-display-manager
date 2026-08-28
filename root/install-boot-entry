@@ -57,9 +57,13 @@ if [[ ! -e "$PORT_CONFIG" ]]; then
   printf 'SUNSHINE_VIRTUAL_CONNECTOR=%s\n' "$DEFAULT_CONNECTOR" >"$PORT_CONFIG"
   chmod 0644 "$PORT_CONFIG"
 fi
-virtual_connector=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" |
-  tail -n1)
-virtual_connector=${virtual_connector//[\"\'[:space:]]/}
+# Read it the way the generated entry will: sourced, not parsed. Unlike the
+# runtime readers this refuses to fall back, because an installer that silently
+# ignored a hand-edited port would hide the mistake until the next reboot.
+virtual_connector=$(
+  . "$PORT_CONFIG" >/dev/null 2>&1 || exit 1
+  printf '%s\n' "${SUNSHINE_VIRTUAL_CONNECTOR-}"
+) || virtual_connector=""
 case "$virtual_connector" in
   DP-3 | HDMI-A-1) ;;
   *)
