@@ -11,10 +11,14 @@ readonly GRUB_DEFAULTS="/etc/default/grub"
 readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
 readonly GRUB_ENV="/boot/grub/grubenv"
 readonly HELPER_PATH="/usr/local/sbin/sunshine-boot-mode"
+readonly PORT_HELPER_PATH="/usr/local/sbin/sunshine-display-port"
+readonly PORT_CONFIG="/etc/default/sunshine-display-manager"
+readonly POLICY_PATH="/usr/share/polkit-1/actions/dev.lieyan.sunshine-display-manager.policy"
 readonly SUDOERS_PATH="/etc/sudoers.d/sunshine-display-manager"
 
 grub-editenv "$GRUB_ENV" unset next_entry || true
-rm -f "$GRUB_SCRIPT" "$HELPER_PATH" "$SUDOERS_PATH"
+rm -f "$GRUB_SCRIPT" "$HELPER_PATH" "$PORT_HELPER_PATH" "$POLICY_PATH" \
+  "$PORT_CONFIG" "$SUDOERS_PATH"
 
 # A saved default that points at a removed entry would leave GRUB without a
 # usable default, so restore the plain first-entry behaviour.

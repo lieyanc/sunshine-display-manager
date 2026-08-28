@@ -10,8 +10,6 @@ readonly GRUB_CFG="/boot/grub/grub.cfg"
 readonly GRUB_ENV="/boot/grub/grubenv"
 readonly VIRTUAL_ID_PREFIX="sunshine-gnulinux-simple-"
 readonly STOCK_ID_PREFIX="gnulinux-simple-"
-readonly CONNECTOR="DP-3"
-readonly EDID_MARKER="drm.edid_firmware=${CONNECTOR}:"
 # /boot/grub is root-only and polling it through sudo would flood the audit log,
 # so the armed state is mirrored here. /run is cleared on boot, which is exactly
 # when the one-shot entry is consumed.
@@ -21,6 +19,17 @@ if ((EUID != 0)); then
   printf 'sunshine-boot-mode must run as root.\n' >&2
   exit 1
 fi
+
+# The virtual display can sit on either port, so the connector to force is
+# whichever one this boot injected the EDID on. Nothing else can be forced: an
+# output without the override would come up with no modes.
+booted_connector() {
+  local cmdline
+  cmdline=$(</proc/cmdline)
+  [[ "$cmdline" =~ drm\.edid_firmware=([A-Za-z0-9-]+):edid/sunshine-4k60-hdr\.bin ]] ||
+    return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
 
 menu_entry_ids() {
   grep -oE -- "(--id|[\$]menuentry_id_option) '[^']*'" "$GRUB_CFG" |
@@ -55,7 +64,7 @@ entry_name() {
 
 status_path() {
   local path
-  for path in /sys/class/drm/card*-"${CONNECTOR}"/status; do
+  for path in /sys/class/drm/card*-"$1"/status; do
     if [[ -w "$path" ]]; then
       printf '%s\n' "$path"
       return 0
@@ -64,20 +73,18 @@ status_path() {
   return 1
 }
 
-edid_injected() {
-  grep -Fq "$EDID_MARKER" /proc/cmdline
-}
-
 print_status() {
-  local path connector=unknown
+  local path connector state=unknown
 
-  if path=$(status_path); then
-    connector=$(<"$path")
+  connector=$(booted_connector || printf 'none\n')
+  if [[ "$connector" != none ]] && path=$(status_path "$connector"); then
+    state=$(<"$path")
   fi
-  printf 'booted=%s\n' "$(edid_injected && printf virtual || printf stock)"
+  printf 'booted=%s\n' "$([[ "$connector" == none ]] && printf stock || printf virtual)"
   printf 'default=%s\n' "$(entry_name "$(grubenv_value saved_entry)")"
   printf 'pending=%s\n' "$(entry_name "$(grubenv_value next_entry)")"
-  printf 'connector=%s\n' "$connector"
+  printf 'connector_name=%s\n' "$connector"
+  printf 'connector=%s\n' "$state"
   printf 'entry_installed=%s\n' \
     "$([[ -n "$(entry_id virtual)" ]] && printf yes || printf no)"
 }
@@ -116,15 +123,15 @@ cancel_pending() {
 # kernel keeps it for the lifetime of that connector, so nothing can inject it
 # later. Refuse rather than force an output that would come up without modes.
 set_connector() {
-  local action=$1 path
+  local action=$1 connector path
 
-  if ! edid_injected; then
-    printf 'No EDID is injected for %s in this boot.\n' "$CONNECTOR" >&2
+  if ! connector=$(booted_connector); then
+    printf 'No EDID is injected in this boot.\n' >&2
     printf 'Reboot into the virtual display entry first.\n' >&2
     return 1
   fi
-  if ! path=$(status_path); then
-    printf 'No writable status attribute for %s.\n' "$CONNECTOR" >&2
+  if ! path=$(status_path "$connector"); then
+    printf 'No writable status attribute for %s.\n' "$connector" >&2
     return 1
   fi
   printf '%s\n' "$action" >"$path"

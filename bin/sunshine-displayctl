@@ -6,18 +6,14 @@ readonly PHYSICAL_CONNECTOR="DP-1"
 # reports the configuration it accepted, which is not always the one the driver
 # committed, so every topology change is confirmed against these.
 readonly PHYSICAL_KERNEL_CONNECTOR="DP-1"
-readonly VIRTUAL_KERNEL_CONNECTOR="DP-3"
 readonly PHYSICAL_MODE="1920x1080@165.001"
-readonly VIRTUAL_CONNECTOR="DP-3"
 readonly VIRTUAL_MODE="3840x2160@59.997"
 readonly VIRTUAL_SCALE="2"
-# Mutter exposes BT.2100 for the injected EDID, but the forced connector has no
-# HDR_OUTPUT_METADATA blob for Sunshine's KMS capture. Keep the end-to-end stream
-# in SDR; see docs/dp-hdr-investigation.zh-CN.md.
-readonly VIRTUAL_COLOR_MODE="default"
 readonly SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
 readonly BOOT_HELPER="/usr/local/sbin/sunshine-boot-mode"
-readonly VIRTUAL_CMDLINE_MARKER="drm.edid_firmware=DP-3:"
+readonly PORT_HELPER="/usr/local/sbin/sunshine-display-port"
+readonly PORT_CONFIG="/etc/default/sunshine-display-manager"
+readonly DEFAULT_PORT_CONNECTOR="DP-3"
 readonly BOOT_PENDING_MARKER="/run/sunshine-display-boot-pending"
 readonly INHIBIT_SERVICE="sunshine-display-inhibit.service"
 
@@ -36,10 +32,76 @@ mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR"
 exec 9>"$LOCK_FILE"
 flock -x 9
 
+# The virtual display can live on either of two ports. Everything about it is
+# identical except the connector and the colour space: HDR needs DRM metadata the
+# driver only emits over HDMI, so a forced DisplayPort connector stays SDR. See
+# docs/dp-hdr-investigation.zh-CN.md for the evidence.
+port_connector() {
+  case "$1" in
+    dp) printf 'DP-3\n' ;;
+    hdmi) printf 'HDMI-A-1\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+port_name() {
+  case "$1" in
+    DP-3) printf 'dp\n' ;;
+    HDMI-A-1) printf 'hdmi\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# Mutter names the HDMI connector differently from the kernel.
+port_monitor() {
+  case "$1" in
+    HDMI-A-1) printf 'HDMI-1\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+port_color_mode() {
+  case "$1" in
+    HDMI-A-1) printf 'bt2100\n' ;;
+    *) printf 'default\n' ;;
+  esac
+}
+
+# The EDID can only be injected at boot, so the port carrying the virtual display
+# is whatever the running kernel was told to override. Empty means this boot has
+# no virtual display at all.
+booted_port_connector() {
+  local cmdline
+  cmdline=$(</proc/cmdline)
+  [[ "$cmdline" =~ drm\.edid_firmware=([A-Za-z0-9-]+):edid/sunshine-4k60-hdr\.bin ]] ||
+    return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# What the boot entry will inject next time. Root owns the file but everyone can
+# read it, so the indicator can show a queued switch without asking for a password.
+configured_port_connector() {
+  local value=""
+
+  if [[ -r "$PORT_CONFIG" ]]; then
+    value=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" | tail -n1)
+    value=${value//[\"\'[:space:]]/}
+  fi
+  if [[ "$(port_name "$value")" == unknown ]]; then
+    value=$DEFAULT_PORT_CONNECTOR
+  fi
+  printf '%s\n' "$value"
+}
+
+# Under the stock entry there is no injected connector, but the names still have
+# to resolve so status output and error messages can talk about the selected port.
+VIRTUAL_KERNEL_CONNECTOR=$(booted_port_connector || configured_port_connector)
+readonly VIRTUAL_KERNEL_CONNECTOR
+readonly VIRTUAL_CONNECTOR="$(port_monitor "$VIRTUAL_KERNEL_CONNECTOR")"
+readonly VIRTUAL_COLOR_MODE="$(port_color_mode "$VIRTUAL_KERNEL_CONNECTOR")"
+
 AUTO_HIDE_PHYSICAL=1
 STREAM_ACTIVE=0
-PRE_STREAM_TOPOLOGY="unknown"
-MANUAL_OVERRIDE=0
 
 load_settings() {
   local key value
@@ -69,26 +131,12 @@ load_runtime_state() {
   local key value
 
   STREAM_ACTIVE=0
-  PRE_STREAM_TOPOLOGY="unknown"
-  MANUAL_OVERRIDE=0
   [[ -r "$STATE_FILE" ]] || return 0
   while IFS='=' read -r key value; do
     case "$key" in
       stream_active)
         if [[ "$value" == 1 ]]; then
           STREAM_ACTIVE=1
-        fi
-        ;;
-      pre_stream_topology)
-        case "$value" in
-          physical-only | virtual-only | both | unknown)
-            PRE_STREAM_TOPOLOGY=$value
-            ;;
-        esac
-        ;;
-      manual_override)
-        if [[ "$value" == 1 ]]; then
-          MANUAL_OVERRIDE=1
         fi
         ;;
     esac
@@ -99,8 +147,6 @@ save_runtime_state() {
   local tmp
   tmp=$(mktemp "${RUNTIME_DIR}/state.XXXXXX")
   printf 'stream_active=%s\n' "$STREAM_ACTIVE" >"$tmp"
-  printf 'pre_stream_topology=%s\n' "$PRE_STREAM_TOPOLOGY" >>"$tmp"
-  printf 'manual_override=%s\n' "$MANUAL_OVERRIDE" >>"$tmp"
   chmod 0600 "$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
@@ -116,7 +162,7 @@ require_gnome_session() {
 # The EDID can only be injected at boot, so the virtual display is available
 # exactly when the machine booted the entry that carries the kernel argument.
 boot_mode() {
-  if grep -Fq "$VIRTUAL_CMDLINE_MARKER" /proc/cmdline; then
+  if booted_port_connector >/dev/null; then
     printf 'virtual\n'
   else
     printf 'stock\n'
@@ -341,21 +387,12 @@ apply_topology() {
   esac
 }
 
-mark_manual_override() {
-  load_runtime_state
-  if ((STREAM_ACTIVE)); then
-    MANUAL_OVERRIDE=1
-    save_runtime_state
-  fi
-}
-
 manual_apply() {
   apply_topology "$1"
   # Nothing should be left holding a connector the topology does not use.
   if [[ "$1" == physical-only ]]; then
     release_virtual_connector
   fi
-  mark_manual_override
 }
 
 start_inhibitor() {
@@ -384,8 +421,6 @@ stream_start() {
   fi
 
   STREAM_ACTIVE=1
-  PRE_STREAM_TOPOLOGY=$original
-  MANUAL_OVERRIDE=0
   save_runtime_state
   start_inhibitor
 
@@ -399,27 +434,28 @@ stream_start() {
       stop_inhibitor
       apply_topology "$original" || true
       STREAM_ACTIVE=0
-      PRE_STREAM_TOPOLOGY="unknown"
       save_runtime_state
       return 1
     fi
   fi
 }
 
+# The topology that was on screen before the stream is deliberately not restored.
+# Restoring a dual layout would leave the virtual display in Mutter after the
+# session ends, and the whole point of the forced connector is that it exists only
+# while something is streaming to it.
 stream_stop() {
   load_runtime_state
   stop_inhibitor
   ((STREAM_ACTIVE)) || return 0
 
-  if ((MANUAL_OVERRIDE == 0)); then
-    apply_topology "$PRE_STREAM_TOPOLOGY" || apply_physical_only
-  fi
+  apply_physical_only || true
+  # Handing the connector back while Mutter still scans out of it would black the
+  # desktop, so only release it once the physical display is the live output.
   if [[ "$(current_topology)" == physical-only ]]; then
     release_virtual_connector
   fi
   STREAM_ACTIVE=0
-  PRE_STREAM_TOPOLOGY="unknown"
-  MANUAL_OVERRIDE=0
   save_runtime_state
 }
 
@@ -434,8 +470,6 @@ recover_physical() {
   apply_physical_only
   release_virtual_connector
   STREAM_ACTIVE=0
-  PRE_STREAM_TOPOLOGY="unknown"
-  MANUAL_OVERRIDE=0
   save_runtime_state
 }
 
@@ -463,13 +497,68 @@ boot_cancel() {
   fi
 }
 
+# Moving the virtual display to the other port rewrites the kernel arguments of a
+# GRUB entry, which is deliberately kept out of the passwordless sudoers rule: it
+# is a rare, deliberate action, so it authenticates every time.
+run_as_root() {
+  if [[ -t 0 ]]; then
+    sudo -- "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  else
+    printf 'No terminal to ask for a password on and pkexec is unavailable.\n' >&2
+    return 1
+  fi
+}
+
+port_switch() {
+  local target=$1 connector
+
+  connector=$(port_connector "$target") || return 2
+  if [[ ! -x "$PORT_HELPER" ]]; then
+    printf 'Cannot run %s. Run root/install-boot-entry to set it up.\n' \
+      "$PORT_HELPER" >&2
+    return 1
+  fi
+  if [[ "$(configured_port_connector)" == "$connector" &&
+    "$(booted_port_connector || true)" == "$connector" ]]; then
+    printf 'The virtual display already uses %s.\n' "$connector"
+    return 0
+  fi
+  run_as_root "$PORT_HELPER" "$target" || return 1
+  # The running kernel keeps the port it was booted with, so the switch is only
+  # real after a reboot into the virtual entry the helper just made the default.
+  boot_helper reboot
+}
+
+port_status() {
+  local booted
+
+  booted=$(booted_port_connector || printf 'none\n')
+  printf 'port=%s\n' "$(port_name "$VIRTUAL_KERNEL_CONNECTOR")"
+  printf 'port_connector=%s\n' "$booted"
+  printf 'port_monitor=%s\n' "$VIRTUAL_CONNECTOR"
+  printf 'port_color_mode=%s\n' "$VIRTUAL_COLOR_MODE"
+  printf 'port_configured=%s\n' "$(port_name "$(configured_port_connector)")"
+}
+
 sunshine_control() {
   systemctl --user "$1" "$SUNSHINE_SERVICE"
 }
 
+# Extracts one monitor's block out of gdctl's tree so a property is read from the
+# monitor it belongs to rather than from anywhere in the output.
+monitor_block() {
+  awk -v want="Monitor $1 (" '
+    index($0, want) { block = 1; next }
+    block && (index($0, "Monitor ") || $0 == "Logical monitors:") { exit }
+    block { print }
+  ' <<<"$2"
+}
+
 print_status_json() {
   local topology physical=false virtual=false sunshine=false hdr=false auto=false stream=false
-  local display_state attached=false injected=false
+  local display_state attached=false injected=false port configured
 
   load_settings
   load_runtime_state
@@ -490,8 +579,9 @@ print_status_json() {
   if systemctl --user is-active --quiet "$SUNSHINE_SERVICE"; then
     sunshine=true
   fi
-  if $virtual &&
-    grep -E 'color-mode[^[:alpha:]].*bt2100' <<<"$display_state" >/dev/null; then
+  # supported-color-modes also lists bt2100, so only the active property counts.
+  if $virtual && monitor_block "$VIRTUAL_CONNECTOR" "$display_state" |
+    grep -E 'color-mode[^[:alpha:]].*bt2100' >/dev/null; then
     hdr=true
   fi
   if ((AUTO_HIDE_PHYSICAL)); then
@@ -500,14 +590,19 @@ print_status_json() {
   if ((STREAM_ACTIVE)); then
     stream=true
   fi
+  port=$(port_name "$VIRTUAL_KERNEL_CONNECTOR")
+  configured=$(port_name "$(configured_port_connector)")
 
   printf '{"topology":"%s","physical":%s,"virtual":%s,' \
     "$topology" "$physical" "$virtual"
   printf '"virtual_hdr":%s,"sunshine":%s,"stream_active":%s,' \
     "$hdr" "$sunshine" "$stream"
-  printf '"auto_hide_physical":%s,"manual_override":%s,' \
-    "$auto" "$([[ $MANUAL_OVERRIDE == 1 ]] && printf true || printf false)"
+  printf '"auto_hide_physical":%s,' "$auto"
   printf '"virtual_injected":%s,"virtual_attached":%s,' "$injected" "$attached"
+  printf '"virtual_port":"%s","virtual_port_configured":"%s",' "$port" "$configured"
+  printf '"virtual_connector":"%s","virtual_port_hdr":%s,' \
+    "$VIRTUAL_CONNECTOR" \
+    "$([[ "$VIRTUAL_COLOR_MODE" == bt2100 ]] && printf true || printf false)"
   printf '"boot_mode":"%s","boot_pending":"%s"}\n' \
     "$(boot_mode)" "$(boot_pending)"
 }
@@ -528,6 +623,7 @@ Usage: ${0##*/} <command>
 Status
   status              current topology, boot mode and settings as JSON
   boot-status         current boot mode and the armed next boot
+  port-status         the port the virtual display uses now and after a reboot
   verify              ask Mutter to validate every topology
 
 Displays
@@ -546,6 +642,10 @@ Boot mode
   boot-cancel         clear the armed boot without rebooting
   attach              force the virtual connector on
   detach              hand the virtual connector back
+
+Virtual display port
+  port-dp             put the virtual display on DP-3, SDR, and reboot now
+  port-hdmi           put the virtual display on HDMI-A-1, HDR, and reboot now
 
 Sunshine
   sunshine-on         start the Sunshine user service
@@ -600,6 +700,9 @@ case "${1:-status}" in
   boot-virtual) boot_switch virtual ;;
   boot-stock) boot_switch stock ;;
   boot-cancel) boot_cancel ;;
+  port-status) port_status ;;
+  port-dp) port_switch dp ;;
+  port-hdmi) port_switch hdmi ;;
   attach)
     if [[ "$(boot_mode)" == virtual ]]; then
       ensure_virtual_connector

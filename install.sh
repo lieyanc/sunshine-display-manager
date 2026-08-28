@@ -70,6 +70,9 @@ printf 'Run %s help for the full command list.\n' "$BIN_DIR/sunshine-displayctl"
 if [[ ! -x /usr/local/sbin/sunshine-boot-mode ]]; then
   printf '\nThe boot mode helper is missing, so the virtual display cannot be\n'
   printf 'armed from a menu or over SSH. Run %s/root/install-boot-entry.\n' "$REPO_DIR"
+elif [[ ! -x /usr/local/sbin/sunshine-display-port ]]; then
+  printf '\nThe port helper is missing, so the virtual display cannot be moved\n'
+  printf 'between DP-3 and HDMI. Re-run %s/root/install-boot-entry.\n' "$REPO_DIR"
 fi
 
 gdm_home=$(getent passwd gdm | cut -d: -f6) || gdm_home=""

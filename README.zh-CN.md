@@ -10,21 +10,42 @@
 | 用途 | 内核连接器 | GNOME 连接器 | 模式 |
 | --- | --- | --- | --- |
 | 物理显示器 | `DP-1` | `DP-1` | `1920x1080@165.001`、SDR |
-| 虚拟显示器 | `DP-3` | `DP-3` | `3840x2160@59.997`、SDR、200% 缩放 |
+| 虚拟显示器 | `DP-3` 或 `HDMI-A-1` | `DP-3` 或 `HDMI-1` | `3840x2160@59.997`、200% 缩放 |
 
 虚拟显示器由两套互相独立的机制构成，缺一不可：
 
 - **EDID 注入**：内核参数
-  `drm.edid_firmware=DP-3:edid/sunshine-4k60-hdr.bin` 让该端口使用伪造的 4K60
+  `drm.edid_firmware=<连接器>:edid/sunshine-4k60-hdr.bin` 让该端口使用伪造的 4K60
   EDID。这件事只能在启动时完成，见[启动条目](#启动条目)。
-- **连接器强制**：往 `/sys/class/drm/card*-DP-3/status` 写 `on` 让内核报告该端口
+- **连接器强制**：往 `/sys/class/drm/card*-<连接器>/status` 写 `on` 让内核报告该端口
   已连接，写 `detect` 交还。这一步是纯运行时的。
 
 所以虚拟显示器在被要求之前根本不存在。
 
-`DP-3` 是这台机器上永远不会插线的端口，用它可以把 HDMI 口留给真实显示器。Mutter
-现在可以把它切到 `bt2100`，但连接器仍没有 Sunshine 所需的 DRM HDR 元数据，所以
-主线继续使用 SDR。完整证据和备选方案见 [DP-3 HDR 调查记录](docs/dp-hdr-investigation.zh-CN.md)。
+## 虚拟显示器端口
+
+虚拟显示器落在两个端口之一，任何时刻只有一个端口挂着伪造的 EDID。端口只决定色彩
+空间，别的什么都不决定：
+
+| 端口 | 内核 / GNOME 连接器 | 色彩模式 | Sunshine 输出 | 代价 |
+| --- | --- | --- | --- | --- |
+| `dp`（默认） | `DP-3` / `DP-3` | `default` | 4K60 10-bit SDR | 无，`DP-3` 在这台机器上永远不插线 |
+| `hdmi` | `HDMI-A-1` / `HDMI-1` | `bt2100` | 4K60 HDR10 | 只要启动虚拟条目，HDMI 口就一直挂着伪 EDID |
+
+其余部分——分辨率、200% 缩放、双屏布局、自动化、greeter 处理——两种端口完全一致。
+为什么只有 HDMI 能出 HDR 见[下文](#hdr-只在-hdmi-上成立)。
+
+切换端口要改写 GRUB 条目的内核参数，因此会通过 polkit 交互请求密码，然后重启：
+
+```bash
+sunshine-displayctl port-status   # 当前使用的端口和下次启动使用的端口
+sunshine-displayctl port-dp       # 切到 DP-3、SDR，并立即重启
+sunshine-displayctl port-hdmi     # 切到 HDMI-A-1、HDR，并立即重启
+```
+
+状态栏里同样有这组切换（一对单选项）。选中的端口存在
+`/etc/default/sunshine-display-manager`，生成的 GRUB 条目每次 `update-grub` 时读取
+它；运行中的内核只认自己启动时的那个端口，所以切换必须重启。
 
 ## 控制逻辑
 
@@ -33,14 +54,17 @@
 - 打开物理显示器：虚拟屏已开则进入双屏，否则进入仅物理屏。
 - 关闭物理显示器：先确保虚拟屏开启，再进入仅虚拟屏。
 - 任何需要虚拟屏的操作都会先强制连接器，并等待内核和 mutter 两边都认账。
-- 虚拟屏固定应用 `3840x2160@59.997`、SDR 和 200% 缩放；物理屏保持 SDR。
+- 虚拟屏固定应用 `3840x2160@59.997` 和 200% 缩放，色彩模式由所在端口决定；物理屏
+  保持 SDR。
 - 每次拓扑切换都用 `/sys/class/drm/card*-*/enabled` 复核，因为 `gdctl` 报告的是
   mutter 接受了什么，不是驱动提交了什么。被驳回的提交视为错误，不会留下"一半
   生效"的状态。
-- Moonlight 启动应用时，Sunshine 的 `global_prep_cmd` 记录当前拓扑。自动控制开启
-  时接入虚拟屏、切换为仅虚拟屏，并抑制空闲与挂起。
-- Sunshine 应用会话结束时恢复此前拓扑；如果不再需要虚拟屏，连接器一并交还。
-- 串流期间手动切换会设置"人工覆盖"，断开时不再恢复旧拓扑。
+- Moonlight 启动应用时，Sunshine 的 `global_prep_cmd` 接入虚拟屏、切换为仅虚拟屏，
+  并抑制空闲与挂起。
+- Sunshine 应用会话结束时**一律**回到仅物理屏并交还连接器，即使串流是从双屏开始的
+  也一样。恢复双屏会把虚拟屏留在 mutter 里，而强制连接器的全部意义就是它只在有人
+  串流时存在。
+- 手工打开虚拟屏的菜单项仍然保留（调试用），它们是虚拟屏在串流之外出现的唯一途径。
 
 这里的"连接"指 Moonlight 启动 Sunshine 应用并建立串流会话，不是客户端仅仅浏览
 主机应用列表。
@@ -54,8 +78,9 @@
 ```
 
 `install-edid` 安装 EDID 固件并写进 initramfs；`install-boot-entry` 生成 GRUB
-条目、安装运行时 helper 和只针对它的免密 sudo 规则；`install.sh` 安装用户级
-CLI、状态栏和两个用户 unit。EDID 在下一次启动时注入。
+条目、安装两个运行时 helper、只针对启动条目 helper 的免密 sudo 规则，以及端口
+helper 的 polkit action；`install.sh` 安装用户级 CLI、状态栏和两个用户 unit。
+EDID 在下一次启动时注入。
 
 ## 启动条目
 
@@ -63,17 +88,19 @@ EDID 参数不写进默认命令行，而是单独生成一个 GRUB 菜单项：
 
 | 菜单项 | 内核参数 | 结果 |
 | --- | --- | --- |
-| `Ubuntu (virtual display)`（默认） | `drm.edid_firmware=DP-3:edid/sunshine-4k60-hdr.bin` | `DP-3` 可随时被强制成 4K60 虚拟显示器 |
-| `Ubuntu` | 无 | `DP-3` 恢复普通端口行为，没有虚拟显示器 |
+| `Ubuntu (virtual display)`（默认） | `drm.edid_firmware=<端口>:edid/sunshine-4k60-hdr.bin` | 选中的端口可随时被强制成 4K60 虚拟显示器 |
+| `Ubuntu` | 无 | 选中的端口恢复普通端口行为，没有虚拟显示器 |
 
 默认是虚拟条目：它注入的连接器在被要求之前始终断开，所以开机常驻没有代价；原版
-条目留在菜单里，供 `DP-3` 真的要当普通端口用时使用。
+条目留在菜单里，供该端口真的要当普通端口用时使用。
 
 `/etc/grub.d/11_linux_sunshine` 用改过的参数和标题重新执行 `10_linux`，因此内核
-升级后两套条目自动同步，不存在写死的内核路径；生成的菜单标识符统一加 `sunshine-`
-前缀，与原版条目区分。
+升级后两套条目自动同步，不存在写死的内核路径。端口不写死在里面，而是从
+`/etc/default/sunshine-display-manager` 读取——这正是[切换端口](#虚拟显示器端口)
+只需要改一行加一次重启的原因。生成的菜单标识符统一加 `sunshine-` 前缀，与原版条目
+区分。
 
-注意参数里**没有** `video=DP-3:e`。那个参数会让连接器开机即被报告为已连接，登录
+注意参数里**没有** `video=<端口>:e`。那个参数会让连接器开机即被报告为已连接，登录
 界面就会跑到虚拟屏上。去掉之后连接器完全由运行时控制；固件 EDID 会在连接器首次
 运行时探测时加载，什么都没损失。
 
@@ -94,8 +121,8 @@ sunshine-displayctl boot-cancel    # 只清除排队，不重启
 排队只影响下一次启动。排队状态镜像在 `/run/sunshine-display-boot-pending`，状态栏
 因此可以直接轮询而不需要 root。
 
-由于虚拟屏是运行时开关，日常串流不需要重启——只有真的要把 `DP-3` 交还给普通用途
-时才需要。
+由于虚拟屏是运行时开关，日常串流不需要重启——只有真的要把注入的端口交还给普通用途，
+或者要把虚拟屏挪到另一个端口时才需要。
 
 ### 原版条目下的行为
 
@@ -131,6 +158,8 @@ GDM 50 起 greeter 以动态用户 `gdm-greeter` 运行，家目录是 tmpfs 上
 - 开关"串流时自动关闭物理显示器"
 - 显示当前启动条目，并重启切换到虚拟条目或原版条目（带确认对话框）
 - 取消已排队但尚未生效的启动条目
+- 在 `DP-3 (SDR)` 和 `HDMI (HDR)` 之间切换虚拟屏所在端口（带确认对话框和 polkit
+  密码框）
 - 启停 Sunshine 服务
 - 打开 Sunshine Web 管理页面
 - 强制恢复物理显示器
@@ -153,11 +182,12 @@ sunshine-displayctl help
 ```
 
 ```text
-状态    status  boot-status  verify
+状态    status  boot-status  port-status  verify
 显示    physical-only  virtual-only  both
         physical-on  physical-off  virtual-on  virtual-off  recover
 连接器  attach  detach
 启动    boot-virtual  boot-stock  boot-cancel
+端口    port-dp  port-hdmi
 服务    sunshine-on  sunshine-off  sunshine-restart
 自动化  auto-on  auto-off  stream-start  stream-stop
 ```
@@ -168,12 +198,22 @@ Sunshine 的会话钩子，`attach` 和 `detach` 是连接器钩子，都不需�
 `recover` 会停止串流抑制器、清除运行时会话状态、交还虚拟连接器，并强制把 `DP-1`
 恢复到 `1920x1080@165.001` SDR。
 
-## 无 sink 的 DP-3 与 HDR
+`port-dp` 和 `port-hdmi` 是唯二会要密码的命令：在终端里走 `sudo`，从状态栏调用时走
+`pkexec`。其余命令要么不需要权限，要么走免密的
+`/usr/local/sbin/sunshine-boot-mode`。
 
-GNOME 设置显示 `bt2100` 不代表这条强制 DP 链路已经具备端到端 HDR。当前 DP-3 的
-`HDR_OUTPUT_METADATA` 和 `Colorspace` DRM 属性仍为 0，Sunshine 因而编码成 10-bit
-SDR 而非 HDR10。主线将 DP-3 明确定义为 SDR；完整探索过程、旧环境结果、Sunshine
-源码判定和两种潜在实现路线见 [DP-3 HDR 调查记录](docs/dp-hdr-investigation.zh-CN.md)。
+## HDR 只在 HDMI 上成立
+
+`DP-3` 是这台机器上永远不会插线的端口，本来是伪造 EDID 最自然的落点，还能把 HDMI
+口留给真实显示器。但它带不动 HDR。Mutter 接受它切到 `bt2100`，GNOME 里的 HDR 开关
+也能打开，但 DRM 连接器的 `HDR_OUTPUT_METADATA` 和 `Colorspace` 属性仍然是 0，
+Sunshine 的 KMS 捕获因此把这块输出判定为 SDR，编码出来的是 10-bit SDR 而不是 HDR10。
+DisplayPort 上的 HDR 需要驱动从 sink 的 DPCD 里读能力位，伪造的 EDID 造不出可读的
+链路。
+
+HDMI 是单向 TMDS：HDR InfoFrame 不需要握手就直接发出去，所以强制的连接器在那边确实
+能带 HDR——代价是这个口。完整探索过程、旧环境结果、Sunshine 源码判定和两种潜在实现
+路线见 [DP-3 HDR 调查记录](docs/dp-hdr-investigation.zh-CN.md)。
 
 Sunshine 抓的是它找到的第一块处于活动状态的输出。物理屏是唯一活动输出时它记录
 `Found connector ID [825]`（`DP-1`），虚拟屏是唯一活动输出时记录
@@ -181,10 +221,10 @@ Sunshine 抓的是它找到的第一块处于活动状态的输出。物理屏�
 
 ## 端口限制
 
-在虚拟条目下，`DP-3` 始终使用伪造的 AOC EDID。把真实显示器插进这个口，系统不会
+在虚拟条目下，选中的端口始终使用伪造的 AOC EDID。把真实显示器插进这个口，系统不会
 读它自己的 EDID：能容忍 4K60 时序的显示器也许还能亮，但模式、HDR、音频能力和热
-插拔状态都是错的。要正常使用这个口，重启选原版条目即可，不必卸载任何东西。
-`DP-1`、`DP-2` 和 HDMI 完全不受影响。
+插拔状态都是错的。要正常使用这个口，重启选原版条目、或者把虚拟屏挪到另一个端口即可，
+不必卸载任何东西。除选中的那个口以外，其余端口完全不受影响。
 
 只移除启动项和 sudo 规则、保留 EDID 固件：
 
@@ -207,7 +247,7 @@ Sunshine 抓的是它找到的第一块处于活动状态的输出。物理屏�
 
 - `/sys/module/drm/parameters/edid_firmware` 虽然可写，但 EDID 在连接器首次探测时
   就被装成连接器级 override 并保留到连接器生命周期结束，之后再改这个参数无效。
-- DRM 唯一的运行时注入接口 `/sys/kernel/debug/dri/*/DP-3/edid_override`，在
+- DRM 唯一的运行时注入接口 `/sys/kernel/debug/dri/*/<连接器>/edid_override`，在
   lockdown 下任何写方式的打开都返回 `EPERM`。lockdown 只能升级不能降级，只有在
   固件里关掉 Secure Boot 才能解除。
 - `nvidia`、`nvidia_modeset`、`nvidia_drm` 三个模块都没有 EDID 相关参数，
@@ -233,13 +273,9 @@ Sunshine 抓的是它找到的第一块处于活动状态的输出。物理屏�
 bin/          显示状态控制器
 indicator/    GNOME AppIndicator 状态栏进程
 systemd/      用户服务单元
-root/         EDID 和 GRUB 启动项的安装/移除工具，
-              以及运行时的启动条目与连接器 helper
+root/         EDID 和 GRUB 启动项的安装/移除工具，以及运行时的启动条目、
+              连接器和虚拟屏端口 helper
+polkit/       端口 helper 的 polkit action
 edid/         校验过的 4K60 EDID
 config/       Sunshine 配置片段
 ```
-
-## 分支
-
-- `main`——虚拟显示器在 `DP-3`，4K60 SDR、200% 缩放，HDMI 口保持空闲。
-- `hdmi-hdr`——虚拟显示器在 `HDMI-A-1`，4K60 HDR，代价是占用 HDMI 口。

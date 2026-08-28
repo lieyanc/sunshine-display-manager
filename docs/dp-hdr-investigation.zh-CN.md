@@ -10,11 +10,12 @@
 `HDR_OUTPUT_METADATA`，`Colorspace` 也仍为默认值。Sunshine 的 Linux KMS 捕获因此
 将显示器判断为 SDR，最终生成的是 **10-bit SDR**，不是 HDR10。
 
-项目主线据此继续把强制 `DP-3` 定义为不支持 HDR：
+项目据此继续把强制 `DP-3` 定义为不支持 HDR：
 
 - `DP-3`：`3840x2160@59.997`、SDR、200% 缩放；
 - `DP-1`：`1920x1080@165.001`、SDR；
-- 需要 HDR 时仍使用 `hdmi-hdr` 分支，或以后重新验证本文列出的替代方案。
+- 需要 HDR 时切到 `hdmi` 端口模式（`sunshine-displayctl port-hdmi`），或以后重新
+  验证本文列出的替代方案。
 
 ## 测试环境
 
@@ -197,7 +198,7 @@ maxFullFrameLuminance = 351
 
 这会让 Sunshine 选择 BT.2020/PQ 和 HEVC Main10，但存在重要风险：如果 Mutter 的扫描
 缓冲区并不是真正的 PQ HDR 内容，强制按 HDR10 编码会产生灰雾、过曝或饱和度错误。
-因此这是一种实验性绕过，不足以证明链路正确，主线没有采用。
+因此这是一种实验性绕过，不足以证明链路正确，没有采用。
 
 ### 路线 B：Mutter/NVIDIA 正确提交 DRM metadata
 
@@ -220,19 +221,20 @@ metadata。此时软件之外的方案是使用能模拟完整 AUX/DPCD 的 Disp
 
 ## 回退决定
 
-本次探索结束后，主线控制器恢复：
+本次探索结束后，控制器恢复到「`DP-3` 用 SDR」：`dp` 端口模式的色彩模式是
+`default`，缩放保持独立验证过的 200%。两个端口模式的差异因此只剩连接器和色彩空间：
 
-```bash
-VIRTUAL_COLOR_MODE="default"
-VIRTUAL_SCALE="2"
-```
+| 端口模式 | 连接器 | `--color-mode` | 缩放 |
+| --- | --- | --- | --- |
+| `dp` | `DP-3` | `default` | 2 |
+| `hdmi` | `HDMI-A-1` | `bt2100` | 2 |
 
-即回退 DP-3 HDR，但保留独立验证过的 200% 缩放。主线文档继续明确 DP-3 不支持
-Sunshine 端到端 HDR，避免把 GNOME 设置中的 HDR 开关误认为串流已经进入 HDR10。
+文档继续明确 `DP-3` 不支持 Sunshine 端到端 HDR，避免把 GNOME 设置中的 HDR 开关
+误认为串流已经进入 HDR10。
 
 ## 将来重新打开结论的条件
 
-只有同时满足以下条件，才应重新把主线改成 DP HDR：
+只有同时满足以下条件，才应把 `dp` 端口模式也改成 HDR：
 
 1. `gdctl show --properties` 显示 DP-3 为 `bt2100`；
 2. DP-3 的 `HDR_OUTPUT_METADATA` 为非零 metadata blob；

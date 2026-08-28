@@ -18,6 +18,14 @@ CONTROLLER = os.path.expanduser("~/.local/bin/sunshine-displayctl")
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 LOCK_FILE = os.path.join(RUNTIME_DIR, "sunshine-display-indicator.lock")
 
+# The virtual display is the same 4K60 output on either port; only the connector
+# and the colour space differ. HDR needs DRM metadata the driver emits over HDMI
+# but not over a forced DisplayPort connector.
+PORTS = {
+    "dp": {"label": "DP-3 (SDR)", "short": "DP-3", "command": "port-dp"},
+    "hdmi": {"label": "HDMI (HDR)", "short": "HDMI", "command": "port-hdmi"},
+}
+
 
 def confirm(question, detail):
     dialog = Gtk.MessageDialog(
@@ -39,6 +47,8 @@ class Indicator:
         self.updating = False
         self.busy = False
         self.virtual_injected = True
+        self.virtual_port = "dp"
+        self.virtual_port_configured = "dp"
         self.indicator = AppIndicator3.Indicator.new(
             "sunshine-display-manager",
             "preferences-desktop-display-symbolic",
@@ -53,7 +63,7 @@ class Indicator:
         menu.append(self.status_item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        self.virtual_item = Gtk.CheckMenuItem(label="虚拟显示器 (DP-3, 4K60)")
+        self.virtual_item = Gtk.CheckMenuItem(label="虚拟显示器 (4K60)")
         self.virtual_item.connect("toggled", self.on_virtual_toggled)
         menu.append(self.virtual_item)
 
@@ -91,7 +101,7 @@ class Indicator:
         self.boot_virtual_item.connect("activate", self.on_boot_virtual)
         menu.append(self.boot_virtual_item)
 
-        self.boot_stock_item = Gtk.MenuItem(label="重启到原版条目 (释放 DP-3)")
+        self.boot_stock_item = Gtk.MenuItem(label="重启到原版条目")
         self.boot_stock_item.connect("activate", self.on_boot_stock)
         menu.append(self.boot_stock_item)
 
@@ -100,6 +110,18 @@ class Indicator:
             "activate", lambda _item: self.run_controller("boot-cancel")
         )
         menu.append(self.boot_cancel_item)
+
+        self.port_items = {}
+        first = None
+        for port, spec in PORTS.items():
+            item = Gtk.RadioMenuItem(label=f"虚拟屏端口：{spec['label']}")
+            if first is None:
+                first = item
+            else:
+                item.join_group(first)
+            item.connect("toggled", self.on_port_toggled, port)
+            menu.append(item)
+            self.port_items[port] = item
         menu.append(Gtk.SeparatorMenuItem())
 
         self.sunshine_item = Gtk.CheckMenuItem(label="Sunshine 服务")
@@ -132,20 +154,37 @@ class Indicator:
         GLib.timeout_add_seconds(5, self.refresh)
 
     def on_boot_virtual(self, _item):
+        port = PORTS[self.virtual_port]["short"]
         if confirm(
             "现在重启到虚拟显示器条目？",
-            "这会立即重启主机。重启后 DP-3 会带着注入的 EDID，"
+            f"这会立即重启主机。重启后 {port} 会带着注入的 EDID，"
             "虚拟显示器可以随时打开。",
         ):
             self.run_controller("boot-virtual")
 
     def on_boot_stock(self, _item):
+        port = PORTS[self.virtual_port]["short"]
         if confirm(
             "现在重启到原版条目？",
-            "这会立即重启主机。重启后 DP-3 恢复普通端口行为，"
+            f"这会立即重启主机。重启后 {port} 恢复普通端口行为，"
             "在下一次重启回虚拟条目之前无法串流到虚拟显示器。",
         ):
             self.run_controller("boot-stock")
+
+    # Moving the virtual display to the other port rewrites a boot entry, so it
+    # asks for a password and only takes effect after the reboot it triggers.
+    def on_port_toggled(self, item, port):
+        if self.updating or not item.get_active() or port == self.virtual_port_configured:
+            return
+        spec = PORTS[port]
+        if confirm(
+            f"把虚拟显示器切到 {spec['short']}？",
+            f"这会改写启动条目并立即重启主机，需要输入管理员密码。"
+            f"重启后虚拟显示器在 {spec['label']} 上。",
+        ):
+            self.run_controller(spec["command"])
+        else:
+            self.refresh()
 
     def on_virtual_toggled(self, item):
         if not self.updating:
@@ -210,8 +249,19 @@ class Indicator:
 
         self.updating = True
         self.virtual_injected = state.get("virtual_injected", True)
+        self.virtual_port = state.get("virtual_port", "dp")
+        self.virtual_port_configured = state.get("virtual_port_configured", "dp")
         boot_mode = state.get("boot_mode", "virtual")
         boot_pending = state.get("boot_pending", "none")
+        port = PORTS.get(self.virtual_port, PORTS["dp"])
+        self.virtual_item.set_label(
+            "虚拟显示器 ({}, 4K60 {})".format(
+                port["short"], "HDR" if state.get("virtual_port_hdr") else "SDR"
+            )
+        )
+        self.boot_stock_item.set_label(f"重启到原版条目 (释放 {port['short']})")
+        for name, item in self.port_items.items():
+            item.set_active(name == self.virtual_port_configured)
         self.virtual_item.set_sensitive(self.virtual_injected)
         self.both_item.set_sensitive(self.virtual_injected)
         self.virtual_only_item.set_sensitive(self.virtual_injected)
@@ -243,6 +293,9 @@ class Indicator:
             pending = " | 下次启动：虚拟显示器条目"
         elif boot_pending == "stock":
             pending = " | 下次启动：原版条目"
+        if self.virtual_port_configured != self.virtual_port:
+            queued = PORTS.get(self.virtual_port_configured, PORTS["dp"])["short"]
+            pending += f" | 下次启动：虚拟屏切到 {queued}"
         self.status_item.set_label(f"{physical} | {virtual}{stream}{pending}")
 
         if state["stream_active"]:

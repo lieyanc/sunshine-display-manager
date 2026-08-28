@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Without this file pkexec still works, but the password dialog only says which
+  program is about to run. auth_admin rather than auth_admin_keep: switching the
+  port rewrites a boot entry and reboots, so it authenticates every time.
+-->
+<policyconfig>
+  <vendor>Sunshine Display Manager</vendor>
+  <vendor_url>https://github.com/lieyanc/sunshine-display-manager</vendor_url>
+
+  <action id="dev.lieyan.sunshine-display-manager.set-port">
+    <description>Move the Sunshine virtual display to the other port</description>
+    <description xml:lang="zh_CN">切换 Sunshine 虚拟显示器所在的端口</description>
+    <message>Authentication is required to rewrite the boot entry that carries the virtual display.</message>
+    <message xml:lang="zh_CN">改写承载虚拟显示器的启动条目需要验证身份。</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/sunshine-display-port</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Adds a second GRUB menu entry that injects the forged EDID on the unused DP-3
-# port, makes it the default, and installs the runtime helper that lets the desktop
-# user pick a boot entry and force the connector without a password.
+# Adds a second GRUB menu entry that injects the forged EDID on the port the
+# virtual display currently uses, makes it the default, and installs the runtime
+# helpers that let the desktop user pick a boot entry, force the connector, and
+# move the virtual display to the other port.
 set -euo pipefail
 
 if ((EUID != 0)); then
@@ -11,17 +12,24 @@ fi
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly EDID_RELATIVE="edid/sunshine-4k60-hdr.bin"
 readonly EDID_PATH="/usr/lib/firmware/${EDID_RELATIVE}"
-# DP-3 is a permanently unused port on this machine, so dedicating it to the
-# forged EDID leaves the HDMI port free for a real display. No video=DP-3:e here
-# on purpose: the connector stays disconnected until something forces it on, so
-# the greeter never lands on the virtual display.
-readonly VIRTUAL_CONNECTOR="DP-3"
-readonly KERNEL_ARGS="drm.edid_firmware=${VIRTUAL_CONNECTOR}:${EDID_RELATIVE}"
+# The port is not baked into the generated entry: it is read from PORT_CONFIG at
+# update-grub time so sunshine-display-port can move the virtual display between
+# DP-3 and HDMI-A-1 without rewriting this script. DP-3 is the default because it
+# never gets a cable on this machine and so leaves the HDMI port free; HDMI is the
+# only port where a forced connector carries HDR. No video=<connector>:e here on
+# purpose: the connector stays disconnected until something forces it on, so the
+# greeter never lands on the virtual display.
+readonly DEFAULT_CONNECTOR="DP-3"
+readonly PORT_CONFIG="/etc/default/sunshine-display-manager"
 readonly GRUB_DEFAULTS="/etc/default/grub"
 readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
 readonly GRUB_CFG="/boot/grub/grub.cfg"
 readonly HELPER_SOURCE="${SCRIPT_DIR}/sunshine-boot-mode"
 readonly HELPER_PATH="/usr/local/sbin/sunshine-boot-mode"
+readonly PORT_HELPER_SOURCE="${SCRIPT_DIR}/sunshine-display-port"
+readonly PORT_HELPER_PATH="/usr/local/sbin/sunshine-display-port"
+readonly POLICY_SOURCE="${SCRIPT_DIR}/../polkit/dev.lieyan.sunshine-display-manager.policy"
+readonly POLICY_PATH="/usr/share/polkit-1/actions/dev.lieyan.sunshine-display-manager.policy"
 readonly SUDOERS_PATH="/etc/sudoers.d/sunshine-display-manager"
 
 target_user=${1:-${SUDO_USER:-}}
@@ -38,6 +46,28 @@ if [[ ! -r /etc/grub.d/10_linux ]]; then
   printf '/etc/grub.d/10_linux is missing. Is this a GRUB system?\n' >&2
   exit 1
 fi
+if [[ ! -r "$POLICY_SOURCE" ]]; then
+  printf '%s is missing.\n' "$POLICY_SOURCE" >&2
+  exit 1
+fi
+
+# Reinstalling must not move the virtual display back to the default port behind
+# the user's back, so an existing selection is kept.
+if [[ ! -e "$PORT_CONFIG" ]]; then
+  printf 'SUNSHINE_VIRTUAL_CONNECTOR=%s\n' "$DEFAULT_CONNECTOR" >"$PORT_CONFIG"
+  chmod 0644 "$PORT_CONFIG"
+fi
+virtual_connector=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" |
+  tail -n1)
+virtual_connector=${virtual_connector//[\"\'[:space:]]/}
+case "$virtual_connector" in
+  DP-3 | HDMI-A-1) ;;
+  *)
+    printf '%s names an unsupported connector: %s\n' "$PORT_CONFIG" \
+      "$virtual_connector" >&2
+    exit 1
+    ;;
+esac
 
 cp --archive --update=none "$GRUB_DEFAULTS" "${GRUB_DEFAULTS}.before-sunshine-boot-entry"
 
@@ -72,15 +102,24 @@ if grep -Eq '^[ \t]*GRUB_TIMEOUT=0[ \t]*$' "$GRUB_DEFAULTS"; then
 fi
 
 # Re-runs the stock linux entry generator with the extra kernel arguments and a
-# different title, so kernel upgrades keep both entries in sync. Every generated
-# menu identifier is prefixed to keep it distinct from the stock entries.
+# different title, so kernel upgrades keep both entries in sync. The connector is
+# read from PORT_CONFIG on every update-grub, which is what makes switching ports
+# a one-line change plus a reboot. Every generated menu identifier is prefixed to
+# keep it distinct from the stock entries.
 cat >"$GRUB_SCRIPT" <<EOF
 #!/bin/sh
 set -e
 
 [ -r "${EDID_PATH}" ] || exit 0
 
-GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} ${KERNEL_ARGS}"
+SUNSHINE_VIRTUAL_CONNECTOR="${DEFAULT_CONNECTOR}"
+[ -r "${PORT_CONFIG}" ] && . "${PORT_CONFIG}"
+case "\$SUNSHINE_VIRTUAL_CONNECTOR" in
+  DP-3 | HDMI-A-1) ;;
+  *) SUNSHINE_VIRTUAL_CONNECTOR="${DEFAULT_CONNECTOR}" ;;
+esac
+
+GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} drm.edid_firmware=\${SUNSHINE_VIRTUAL_CONNECTOR}:${EDID_RELATIVE}"
 GRUB_DISTRIBUTOR="\${GRUB_DISTRIBUTOR} (virtual display)"
 GRUB_DISABLE_RECOVERY=true
 export GRUB_CMDLINE_LINUX_DEFAULT GRUB_DISTRIBUTOR GRUB_DISABLE_RECOVERY
@@ -95,7 +134,11 @@ EOF
 chmod 0755 "$GRUB_SCRIPT"
 
 install --mode=0755 --owner=root --group=root "$HELPER_SOURCE" "$HELPER_PATH"
+install --mode=0755 --owner=root --group=root "$PORT_HELPER_SOURCE" "$PORT_HELPER_PATH"
+install --mode=0644 --owner=root --group=root "$POLICY_SOURCE" "$POLICY_PATH"
 
+# Only the boot mode helper is passwordless. Moving the virtual display to the
+# other port goes through pkexec instead, so it authenticates every time.
 tmp_sudoers=$(mktemp)
 trap 'rm -f "$tmp_sudoers"' EXIT
 printf '%s ALL=(root) NOPASSWD: %s\n' "$target_user" "$HELPER_PATH" >"$tmp_sudoers"
@@ -121,13 +164,16 @@ fi
 
 # The virtual entry is the default because the connector it injects stays
 # disconnected until a session asks for it, so it costs nothing to boot. The
-# stock entry stays in the menu for when DP-3 has to behave like a normal port.
+# stock entry stays in the menu for when the injected port has to behave like a
+# normal one.
 grub-set-default "$virtual_id"
 
 printf '\nInstalled the virtual display boot entry.\n'
 printf '  default entry: %s\n' "$virtual_id"
 printf '  stock entry:   %s\n' "$stock_id"
-printf '  injected EDID: %s\n' "$KERNEL_ARGS"
+printf '  injected EDID: drm.edid_firmware=%s:%s\n' "$virtual_connector" "$EDID_RELATIVE"
 printf '%s can now arm a one-shot boot and force the connector without a password.\n' \
   "$target_user"
+printf 'Moving the virtual display to the other port asks for a password:\n'
+printf '  sunshine-displayctl port-dp | port-hdmi\n'
 printf 'The running system keeps its current kernel arguments until the next reboot.\n'

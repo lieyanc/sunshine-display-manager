@@ -10,24 +10,46 @@ A 4K60 virtual display for Sunshine on this host: GNOME Wayland, NVIDIA RTX
 | Role | Kernel connector | GNOME connector | Mode |
 | --- | --- | --- | --- |
 | Physical display | `DP-1` | `DP-1` | `1920x1080@165.001`, SDR |
-| Virtual display | `DP-3` | `DP-3` | `3840x2160@59.997`, SDR, 200% scale |
+| Virtual display | `DP-3` or `HDMI-A-1` | `DP-3` or `HDMI-1` | `3840x2160@59.997`, 200% scale |
 
 The virtual display is two independent mechanisms, and it needs both:
 
 - **EDID injection.** The kernel argument
-  `drm.edid_firmware=DP-3:edid/sunshine-4k60-hdr.bin` makes the port use a
+  `drm.edid_firmware=<connector>:edid/sunshine-4k60-hdr.bin` makes the port use a
   forged 4K60 EDID. This can only happen at boot, see [Boot entries](#boot-entries).
-- **Connector forcing.** Writing `on` to `/sys/class/drm/card*-DP-3/status`
+- **Connector forcing.** Writing `on` to `/sys/class/drm/card*-<connector>/status`
   makes the kernel report the port as connected; writing `detect` hands it
   back. This is purely a runtime switch.
 
 So the virtual display does not exist until something asks for it.
 
-`DP-3` is a port that never gets a cable on this machine, which leaves the HDMI
-port free for a real display. Mutter can now select `bt2100` on it, but the
-connector still lacks the DRM HDR metadata required by Sunshine, so the main
-branch remains SDR. See the [DP-3 HDR investigation](docs/dp-hdr-investigation.zh-CN.md)
-for the evidence and possible future approaches.
+## Virtual display port
+
+The virtual display lives on one of two ports, and only one port carries the
+forged EDID at a time. The port decides the colour space and nothing else:
+
+| Port | Kernel / GNOME connector | Colour mode | Sunshine output | Cost |
+| --- | --- | --- | --- | --- |
+| `dp` (default) | `DP-3` / `DP-3` | `default` | 4K60 10-bit SDR | none, `DP-3` never gets a cable on this machine |
+| `hdmi` | `HDMI-A-1` / `HDMI-1` | `bt2100` | 4K60 HDR10 | the HDMI port carries the forged EDID whenever the virtual entry is booted |
+
+Everything else — mode, 200% scale, dual-screen layout, automation, greeter
+handling — is identical on both. Why only HDMI can do HDR is
+[below](#hdr-only-works-on-hdmi).
+
+Switching rewrites the kernel arguments of a GRUB entry, so it asks for a
+password through polkit and then reboots:
+
+```bash
+sunshine-displayctl port-status   # the port in use now and after the next boot
+sunshine-displayctl port-dp       # move to DP-3, SDR, reboot now
+sunshine-displayctl port-hdmi     # move to HDMI-A-1, HDR, reboot now
+```
+
+The indicator has the same switch as a pair of radio items. The selected port is
+stored in `/etc/default/sunshine-display-manager`, which the generated GRUB entry
+reads on every `update-grub`; the running kernel keeps whatever port it booted
+with, which is why the switch reboots.
 
 ## Control logic
 
@@ -41,18 +63,20 @@ for the evidence and possible future approaches.
   go virtual-only.
 - Anything that needs the virtual display forces the connector on first and
   waits for both the kernel and Mutter to agree that it is there.
-- The virtual display always uses `3840x2160@59.997`, SDR, and 200% scale; the
-  physical display remains SDR.
+- The virtual display always uses `3840x2160@59.997` at 200% scale, in the colour
+  mode its port allows; the physical display remains SDR.
 - Every topology change is confirmed against `/sys/class/drm/card*-*/enabled`,
   because `gdctl` reports what Mutter accepted, not what the driver committed.
   A rejected commit is an error, not a silent half-applied state.
-- When Moonlight launches an app, Sunshine's `global_prep_cmd` records the
-  current topology. With automation on, it attaches the virtual display,
-  switches to virtual-only, and inhibits idle and suspend.
-- When the Sunshine app session ends, the previous topology is restored, and
-  the connector is handed back if nothing needs it any more.
-- Switching manually during a stream sets a manual override: the old topology
-  is not restored on disconnect.
+- When Moonlight launches an app, Sunshine's `global_prep_cmd` attaches the
+  virtual display, switches to virtual-only, and inhibits idle and suspend.
+- When the Sunshine app session ends, the topology always returns to
+  physical-only and the connector is handed back — including when the stream
+  started from a dual layout. Restoring a dual layout would leave the virtual
+  display sitting in Mutter after the stream, and the point of the forced
+  connector is that it exists only while something is streaming to it.
+- The menu items that turn the virtual display on by hand are still there for
+  testing; they are the only way it appears outside a stream.
 
 "Connecting" here means Moonlight launching a Sunshine app and establishing a
 stream, not a client merely browsing the host's app list.
@@ -66,9 +90,10 @@ stream, not a client merely browsing the host's app list.
 ```
 
 `install-edid` installs the EDID firmware and pulls it into the initramfs;
-`install-boot-entry` generates the GRUB entry, installs the runtime helper and
-a passwordless sudo rule for it; `install.sh` installs the user-level CLI, the
-indicator and two user units. The EDID is injected on the next boot.
+`install-boot-entry` generates the GRUB entry, installs the two runtime helpers,
+a passwordless sudo rule for the boot-mode one and a polkit action for the port
+one; `install.sh` installs the user-level CLI, the indicator and two user units.
+The EDID is injected on the next boot.
 
 ## Boot entries
 
@@ -77,19 +102,22 @@ GRUB menu entry:
 
 | Entry | Kernel argument | Result |
 | --- | --- | --- |
-| `Ubuntu (virtual display)` (default) | `drm.edid_firmware=DP-3:edid/sunshine-4k60-hdr.bin` | `DP-3` can be forced into a 4K60 virtual display at any time |
-| `Ubuntu` | none | `DP-3` behaves like a normal port, no virtual display |
+| `Ubuntu (virtual display)` (default) | `drm.edid_firmware=<port>:edid/sunshine-4k60-hdr.bin` | the selected port can be forced into a 4K60 virtual display at any time |
+| `Ubuntu` | none | the selected port behaves like a normal one, no virtual display |
 
 The virtual entry is the default: the connector it injects stays disconnected
 until something forces it on, so booting it costs nothing. The stock entry
-stays in the menu for when `DP-3` has to behave like a normal port.
+stays in the menu for when the port has to behave normally.
 
 `/etc/grub.d/11_linux_sunshine` re-runs `10_linux` with modified arguments and a
 different title, so both sets of entries stay in sync across kernel upgrades and
-no kernel path is hardcoded. Every generated menu identifier gets a `sunshine-`
-prefix to keep it distinct from the stock ones.
+no kernel path is hardcoded. It reads the port out of
+`/etc/default/sunshine-display-manager` rather than hardcoding it, which is what
+makes [switching ports](#virtual-display-port) a one-line change plus a reboot.
+Every generated menu identifier gets a `sunshine-` prefix to keep it distinct
+from the stock ones.
 
-Note that there is **no** `video=DP-3:e`. That argument would report the
+Note that there is **no** `video=<port>:e`. That argument would report the
 connector as connected from boot, and the greeter would land on the virtual
 display. Without it the connector is entirely under runtime control; the
 firmware EDID is loaded at the connector's first runtime probe, so nothing is
@@ -113,7 +141,8 @@ Arming only affects the next boot. The armed state is mirrored in
 `/run/sunshine-display-boot-pending` so the indicator can poll it without root.
 
 Since the virtual display is a runtime switch, day-to-day streaming never needs
-a reboot. Only handing `DP-3` back to normal use does.
+a reboot. Only handing the injected port back to normal use, or moving the
+virtual display to the other port, does.
 
 ### Behaviour under the stock entry
 
@@ -154,6 +183,8 @@ offers:
 - Showing the current boot entry, and rebooting into the virtual or stock entry
   behind a confirmation dialog
 - Cancelling an armed but not yet consumed boot entry
+- Moving the virtual display between `DP-3 (SDR)` and `HDMI (HDR)`, behind a
+  confirmation dialog and a polkit password prompt
 - Starting and stopping the Sunshine service
 - Opening the Sunshine web UI
 - Forcing the physical display back
@@ -177,11 +208,12 @@ sunshine-displayctl help
 ```
 
 ```text
-Status      status  boot-status  verify
+Status      status  boot-status  port-status  verify
 Displays    physical-only  virtual-only  both
             physical-on  physical-off  virtual-on  virtual-off  recover
 Connector   attach  detach
 Boot mode   boot-virtual  boot-stock  boot-cancel
+Port        port-dp  port-hdmi
 Sunshine    sunshine-on  sunshine-off  sunshine-restart
 Automation  auto-on  auto-off  stream-start  stream-stop
 ```
@@ -193,14 +225,26 @@ With no argument it prints one line of JSON for the indicator and for scripts.
 `recover` stops the streaming inhibitor, clears the runtime session state, hands
 the virtual connector back and forces `DP-1` back to `1920x1080@165.001` SDR.
 
-## Sink-less DP-3 and HDR
+`port-dp` and `port-hdmi` are the only commands that ask for a password: they use
+`sudo` from a terminal and `pkexec` from the indicator. Everything else either
+needs no privileges or goes through the passwordless
+`/usr/local/sbin/sunshine-boot-mode`.
 
-GNOME reporting `bt2100` does not mean this forced DP path provides end-to-end
-HDR. The connector's `HDR_OUTPUT_METADATA` and `Colorspace` DRM properties are
-still zero, so Sunshine produces 10-bit SDR rather than HDR10. The main branch
-therefore defines DP-3 as SDR. See the [DP-3 HDR investigation](docs/dp-hdr-investigation.zh-CN.md)
-for the full exploration, older-stack results, Sunshine's source-level check,
-and two possible implementation paths.
+## HDR only works on HDMI
+
+`DP-3` is a port that never gets a cable on this machine, so it is the natural
+home for the forged EDID and leaves HDMI free for a real display. It cannot carry
+HDR. Mutter accepts `bt2100` on it and GNOME's HDR switch turns on, but the DRM
+connector's `HDR_OUTPUT_METADATA` and `Colorspace` properties stay zero, so
+Sunshine's KMS capture reads the output as SDR and encodes 10-bit SDR rather than
+HDR10. HDR over DisplayPort needs capability bits the driver reads out of the
+sink's DPCD, and a forged EDID cannot produce a link to read them from.
+
+HDMI is one-way TMDS: the HDR InfoFrame goes out with no handshake, so a forced
+connector there does carry HDR — at the price of the port. See the
+[DP-3 HDR investigation](docs/dp-hdr-investigation.zh-CN.md) for the full
+exploration, older-stack results, Sunshine's source-level check, and two possible
+implementation paths.
 
 Sunshine captures the first live output it finds. It logged
 `Found connector ID [825]` (`DP-1`) while the physical display was the only live
@@ -209,11 +253,12 @@ That is why streaming switches to virtual-only rather than dual.
 
 ## Port limitation
 
-Under the virtual entry, `DP-3` always uses the forged AOC EDID. A real display
-plugged into it would not have its own EDID read: one that tolerates the 4K60
-timings might still light up, but its modes, HDR and audio capabilities and its
-hotplug state would all be wrong. Reboot into the stock entry to use the port
-normally; nothing has to be uninstalled. `DP-1`, `DP-2` and HDMI are untouched.
+Under the virtual entry, the selected port always uses the forged AOC EDID. A
+real display plugged into it would not have its own EDID read: one that tolerates
+the 4K60 timings might still light up, but its modes, HDR and audio capabilities
+and its hotplug state would all be wrong. Reboot into the stock entry to use the
+port normally, or move the virtual display to the other port; nothing has to be
+uninstalled. Every port except the selected one is untouched.
 
 To remove the boot entry and the sudo rule but keep the EDID firmware:
 
@@ -238,7 +283,7 @@ host:
 - `/sys/module/drm/parameters/edid_firmware` is writable, but the EDID is
   installed as a connector-level override at the connector's first probe and
   kept for its lifetime, so writing the parameter afterwards does nothing.
-- `/sys/kernel/debug/dri/*/DP-3/edid_override`, the only runtime injection
+- `/sys/kernel/debug/dri/*/<connector>/edid_override`, the only runtime injection
   interface DRM has, returns `EPERM` on any write-open under lockdown. Lockdown
   can be raised but never lowered, so only turning Secure Boot off in firmware
   would lift it.
@@ -266,15 +311,9 @@ versions is cleaned up with `./root/remove-greeter-config`.
 bin/          display state controller
 indicator/    GNOME AppIndicator tray process
 systemd/      user service units
-root/         EDID and GRUB boot entry install/remove tools,
-              plus the runtime boot-entry and connector helper
+root/         EDID and GRUB boot entry install/remove tools, plus the runtime
+              boot-entry, connector and virtual display port helpers
+polkit/       polkit action for the port helper
 edid/         the verified 4K60 EDID
 config/       Sunshine configuration fragment
 ```
-
-## Branches
-
-- `main` — the virtual display on `DP-3`, 4K60 SDR at 200% scale, HDMI port left
-  free.
-- `hdmi-hdr` — the virtual display on `HDMI-A-1`, 4K60 HDR, at the cost of the
-  HDMI port.

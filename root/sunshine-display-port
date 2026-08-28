@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Installed as /usr/local/sbin/sunshine-display-port and reached through pkexec,
+# which authenticates every call. Moving the virtual display to the other port
+# rewrites the kernel arguments of a GRUB entry, so it is deliberately kept out of
+# the passwordless sudoers rule that covers sunshine-boot-mode. Like that helper
+# this takes a fixed set of verbs and never a free-form argument.
+set -euo pipefail
+
+readonly PORT_CONFIG="/etc/default/sunshine-display-manager"
+readonly GRUB_CFG="/boot/grub/grub.cfg"
+readonly GRUB_ENV="/boot/grub/grubenv"
+readonly GRUB_SCRIPT="/etc/grub.d/11_linux_sunshine"
+readonly VIRTUAL_ID_PREFIX="sunshine-gnulinux-simple-"
+readonly PENDING_MARKER="/run/sunshine-display-boot-pending"
+readonly DEFAULT_CONNECTOR="DP-3"
+
+if ((EUID != 0)); then
+  printf 'sunshine-display-port must run as root.\n' >&2
+  exit 1
+fi
+
+# Only two ports are ever valid. DP-3 never gets a cable on this machine, so it
+# leaves HDMI free but stays SDR; HDMI is the only port where a forced connector
+# carries HDR. See docs/dp-hdr-investigation.zh-CN.md.
+port_connector() {
+  case "$1" in
+    dp) printf 'DP-3\n' ;;
+    hdmi) printf 'HDMI-A-1\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+port_name() {
+  case "$1" in
+    DP-3) printf 'dp\n' ;;
+    HDMI-A-1) printf 'hdmi\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+booted_connector() {
+  local cmdline
+  cmdline=$(</proc/cmdline)
+  [[ "$cmdline" =~ drm\.edid_firmware=([A-Za-z0-9-]+):edid/sunshine-4k60-hdr\.bin ]] ||
+    return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+configured_connector() {
+  local value=""
+
+  if [[ -r "$PORT_CONFIG" ]]; then
+    value=$(sed -n 's/^[[:space:]]*SUNSHINE_VIRTUAL_CONNECTOR=//p' "$PORT_CONFIG" | tail -n1)
+    value=${value//[\"\'[:space:]]/}
+  fi
+  if [[ "$(port_name "$value")" == unknown ]]; then
+    value=$DEFAULT_CONNECTOR
+  fi
+  printf '%s\n' "$value"
+}
+
+menu_entry_ids() {
+  grep -oE -- "(--id|[\$]menuentry_id_option) '[^']*'" "$GRUB_CFG" |
+    sed -E "s/^[^']*'//; s/'\$//"
+}
+
+print_status() {
+  printf 'configured=%s\n' "$(configured_connector)"
+  printf 'booted=%s\n' "$(booted_connector || printf 'none\n')"
+}
+
+set_port() {
+  local target=$1 connector virtual_id
+
+  connector=$(port_connector "$target")
+  if [[ ! -x "$GRUB_SCRIPT" ]]; then
+    printf '%s is missing. Run root/install-boot-entry first.\n' "$GRUB_SCRIPT" >&2
+    return 1
+  fi
+  if [[ "$(configured_connector)" == "$connector" ]]; then
+    printf 'The virtual display entry already injects %s.\n' "$connector"
+  else
+    # The generated entry reads this file at update-grub time, so the port is the
+    # only thing that has to change here.
+    printf 'SUNSHINE_VIRTUAL_CONNECTOR=%s\n' "$connector" >"$PORT_CONFIG"
+    chmod 0644 "$PORT_CONFIG"
+    update-grub
+  fi
+
+  virtual_id=$(menu_entry_ids | grep -m1 "^${VIRTUAL_ID_PREFIX}" || true)
+  if [[ -z "$virtual_id" ]]; then
+    printf 'No virtual display entry in %s after update-grub.\n' "$GRUB_CFG" >&2
+    return 1
+  fi
+  # Switching ports only means anything under the virtual entry, so make sure the
+  # next boot lands there instead of on a one-shot armed earlier.
+  grub-editenv "$GRUB_ENV" unset next_entry
+  rm -f "$PENDING_MARKER"
+  grub-set-default "$virtual_id"
+
+  printf 'The virtual display will use %s after the next reboot.\n' "$connector"
+}
+
+case "${1:-status}" in
+  status) print_status ;;
+  dp) set_port dp ;;
+  hdmi) set_port hdmi ;;
+  *)
+    printf 'Usage: %s {status|dp|hdmi}\n' "$0" >&2
+    exit 2
+    ;;
+esac
