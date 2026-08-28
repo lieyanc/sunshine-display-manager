@@ -10,7 +10,7 @@
 | 用途 | 内核连接器 | GNOME 连接器 | 模式 |
 | --- | --- | --- | --- |
 | 物理显示器 | `DP-1` | `DP-1` | `1920x1080@165.001`、SDR |
-| 虚拟显示器 | `DP-3` | `DP-3` | `3840x2160@59.997`、SDR |
+| 虚拟显示器 | `DP-3` | `DP-3` | `3840x2160@59.997`、SDR、200% 缩放 |
 
 虚拟显示器由两套互相独立的机制构成，缺一不可：
 
@@ -22,10 +22,9 @@
 
 所以虚拟显示器在被要求之前根本不存在。
 
-`DP-3` 是这台机器上永远不会插线的端口，用它可以把 HDMI 口留给真实显示器。代价是
-HDR：被强制连接的 DisplayPort 端口带不动 HDR，见[无 sink 的 DisplayPort
-连接器能做什么、不能做什么](#无-sink-的-displayport-连接器能做什么不能做什么)。
-`hdmi-hdr` 分支用 HDMI 口换 HDR。
+`DP-3` 是这台机器上永远不会插线的端口，用它可以把 HDMI 口留给真实显示器。Mutter
+现在可以把它切到 `bt2100`，但连接器仍没有 Sunshine 所需的 DRM HDR 元数据，所以
+主线继续使用 SDR。完整证据和备选方案见 [DP-3 HDR 调查记录](docs/dp-hdr-investigation.zh-CN.md)。
 
 ## 控制逻辑
 
@@ -34,6 +33,7 @@ HDR：被强制连接的 DisplayPort 端口带不动 HDR，见[无 sink 的 Disp
 - 打开物理显示器：虚拟屏已开则进入双屏，否则进入仅物理屏。
 - 关闭物理显示器：先确保虚拟屏开启，再进入仅虚拟屏。
 - 任何需要虚拟屏的操作都会先强制连接器，并等待内核和 mutter 两边都认账。
+- 虚拟屏固定应用 `3840x2160@59.997`、SDR 和 200% 缩放；物理屏保持 SDR。
 - 每次拓扑切换都用 `/sys/class/drm/card*-*/enabled` 复核，因为 `gdctl` 报告的是
   mutter 接受了什么，不是驱动提交了什么。被驳回的提交视为错误，不会留下"一半
   生效"的状态。
@@ -168,38 +168,12 @@ Sunshine 的会话钩子，`attach` 和 `detach` 是连接器钩子，都不需�
 `recover` 会停止串流抑制器、清除运行时会话状态、交还虚拟连接器，并强制把 `DP-1`
 恢复到 `1920x1080@165.001` SDR。
 
-## 无 sink 的 DisplayPort 连接器能做什么、不能做什么
+## 无 sink 的 DP-3 与 HDR
 
-在这台机器上实测，状态从 DRM 读回，而不是看 `gdctl` 的退出码——后者只说明 mutter
-是否接受了请求：
-
-| 拓扑 | 模式 | 色彩模式 | 结果 |
-| --- | --- | --- | --- |
-| 双屏 | `800x600@60.317` | SDR | 生效 |
-| 双屏 | `1920x1080@60.000` | SDR | 生效 |
-| 双屏 | `3840x2160@29.970` | SDR | 生效 |
-| 双屏 | `3840x2160@59.997` | SDR | 生效，3/3 |
-| 双屏 | `3840x2160@59.997` | `sdr-native` | 生效 |
-| 仅虚拟 | `3840x2160@59.997` | SDR | 生效，2/2 |
-| 双屏 | `1920x1080@60.000` | `bt2100` | 被驳回 |
-| 双屏 | `3840x2160@29.970` | `bt2100` | 被驳回 |
-| 双屏 | `3840x2160@59.997` | `bt2100` | 被驳回，3/3 |
-| 仅虚拟 | `3840x2160@59.997` | `bt2100` | 被驳回 |
-
-被驳回长这样：`gdctl` 退出码 0，mutter 显示新布局，
-`/sys/class/drm/card1-DP-3/enabled` 停在 `disabled`，连接器一个 CRTC 都拿不到，
-gnome-shell 以每秒约三十次的频率刷
-
-```text
-Page flip failed: drmModeAtomicCommit: Invalid argument
-```
-
-直到布局被改回去。
-
-所以瓶颈不是带宽——`1920x1080@60` 开 HDR 会失败，而 `3840x2160@60` 走 SDR 能成。
-DisplayPort 上的 HDR 需要驱动从 sink 的 DPCD 里读能力位，伪造的 EDID 造不出可读
-的链路。HDMI 是单向 TMDS，HDR InfoFrame 不需要握手直接发出去，所以 `hdmi-hdr`
-分支能拿到 HDR，代价是 HDMI 口。
+GNOME 设置显示 `bt2100` 不代表这条强制 DP 链路已经具备端到端 HDR。当前 DP-3 的
+`HDR_OUTPUT_METADATA` 和 `Colorspace` DRM 属性仍为 0，Sunshine 因而编码成 10-bit
+SDR 而非 HDR10。主线将 DP-3 明确定义为 SDR；完整探索过程、旧环境结果、Sunshine
+源码判定和两种潜在实现路线见 [DP-3 HDR 调查记录](docs/dp-hdr-investigation.zh-CN.md)。
 
 Sunshine 抓的是它找到的第一块处于活动状态的输出。物理屏是唯一活动输出时它记录
 `Found connector ID [825]`（`DP-1`），虚拟屏是唯一活动输出时记录
@@ -267,6 +241,5 @@ config/       Sunshine 配置片段
 
 ## 分支
 
-- `main`——虚拟显示器在 `DP-3`，4K60 SDR，HDMI 口保持空闲。
-- `hdmi-hdr`——虚拟显示器在 `HDMI-A-1`，4K60 HDR，代价是只要启动虚拟条目，HDMI 口
-  就一直挂着伪造的 EDID。
+- `main`——虚拟显示器在 `DP-3`，4K60 SDR、200% 缩放，HDMI 口保持空闲。
+- `hdmi-hdr`——虚拟显示器在 `HDMI-A-1`，4K60 HDR，代价是占用 HDMI 口。

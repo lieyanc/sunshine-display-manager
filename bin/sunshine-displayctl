@@ -10,9 +10,10 @@ readonly VIRTUAL_KERNEL_CONNECTOR="DP-3"
 readonly PHYSICAL_MODE="1920x1080@165.001"
 readonly VIRTUAL_CONNECTOR="DP-3"
 readonly VIRTUAL_MODE="3840x2160@59.997"
-# A forced DisplayPort connector has no sink to negotiate with, and the driver
-# rejects every atomic commit that asks for BT.2100 on one, at any mode. Only an
-# HDMI connector can carry the HDR metadata without a handshake.
+readonly VIRTUAL_SCALE="2"
+# Mutter exposes BT.2100 for the injected EDID, but the forced connector has no
+# HDR_OUTPUT_METADATA blob for Sunshine's KMS capture. Keep the end-to-end stream
+# in SDR; see docs/dp-hdr-investigation.zh-CN.md.
 readonly VIRTUAL_COLOR_MODE="default"
 readonly SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
 readonly BOOT_HELPER="/usr/local/sbin/sunshine-boot-mode"
@@ -303,7 +304,7 @@ apply_virtual_only() {
   verify=$(verify_flag "${1:-}")
 
   gdctl set ${verify:+"$verify"} --layout-mode logical \
-    --logical-monitor --primary --scale 1 --x 0 --y 0 \
+    --logical-monitor --primary --scale "$VIRTUAL_SCALE" --x 0 --y 0 \
     --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
     --color-mode "$VIRTUAL_COLOR_MODE" --rgb-range auto || return 1
   [[ -n "$verify" ]] || confirm_topology virtual-only
@@ -313,10 +314,10 @@ apply_both() {
   local verify
   verify=$(verify_flag "${1:-}")
   gdctl set ${verify:+"$verify"} --layout-mode logical \
-    --logical-monitor --scale 1 --x 0 --y 0 \
+    --logical-monitor --scale "$VIRTUAL_SCALE" --x 0 --y 0 \
     --monitor "$VIRTUAL_CONNECTOR" --mode "$VIRTUAL_MODE" \
     --color-mode "$VIRTUAL_COLOR_MODE" --rgb-range auto \
-    --logical-monitor --primary --scale 1 --x 552 --y 2160 \
+    --logical-monitor --primary --scale 1 --x 0 --y 1080 \
     --monitor "$PHYSICAL_CONNECTOR" --mode "$PHYSICAL_MODE" \
     --color-mode default --rgb-range auto || return 1
   [[ -n "$verify" ]] || confirm_topology both

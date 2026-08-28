@@ -10,7 +10,7 @@ A 4K60 virtual display for Sunshine on this host: GNOME Wayland, NVIDIA RTX
 | Role | Kernel connector | GNOME connector | Mode |
 | --- | --- | --- | --- |
 | Physical display | `DP-1` | `DP-1` | `1920x1080@165.001`, SDR |
-| Virtual display | `DP-3` | `DP-3` | `3840x2160@59.997`, SDR |
+| Virtual display | `DP-3` | `DP-3` | `3840x2160@59.997`, SDR, 200% scale |
 
 The virtual display is two independent mechanisms, and it needs both:
 
@@ -24,10 +24,10 @@ The virtual display is two independent mechanisms, and it needs both:
 So the virtual display does not exist until something asks for it.
 
 `DP-3` is a port that never gets a cable on this machine, which leaves the HDMI
-port free for a real display. The cost is HDR: a forced DisplayPort connector
-cannot carry it. See [What a sink-less DisplayPort connector can and cannot
-do](#what-a-sink-less-displayport-connector-can-and-cannot-do). The `hdmi-hdr`
-branch trades the HDMI port for working HDR.
+port free for a real display. Mutter can now select `bt2100` on it, but the
+connector still lacks the DRM HDR metadata required by Sunshine, so the main
+branch remains SDR. See the [DP-3 HDR investigation](docs/dp-hdr-investigation.zh-CN.md)
+for the evidence and possible future approaches.
 
 ## Control logic
 
@@ -41,6 +41,8 @@ branch trades the HDMI port for working HDR.
   go virtual-only.
 - Anything that needs the virtual display forces the connector on first and
   waits for both the kernel and Mutter to agree that it is there.
+- The virtual display always uses `3840x2160@59.997`, SDR, and 200% scale; the
+  physical display remains SDR.
 - Every topology change is confirmed against `/sys/class/drm/card*-*/enabled`,
   because `gdctl` reports what Mutter accepted, not what the driver committed.
   A rejected commit is an error, not a silent half-applied state.
@@ -191,40 +193,14 @@ With no argument it prints one line of JSON for the indicator and for scripts.
 `recover` stops the streaming inhibitor, clears the runtime session state, hands
 the virtual connector back and forces `DP-1` back to `1920x1080@165.001` SDR.
 
-## What a sink-less DisplayPort connector can and cannot do
+## Sink-less DP-3 and HDR
 
-Measured on this host, with the state read back from DRM rather than from
-`gdctl`'s exit code, which only reports whether Mutter accepted the request:
-
-| Topology | Mode | Color mode | Result |
-| --- | --- | --- | --- |
-| dual | `800x600@60.317` | SDR | applied |
-| dual | `1920x1080@60.000` | SDR | applied |
-| dual | `3840x2160@29.970` | SDR | applied |
-| dual | `3840x2160@59.997` | SDR | applied, 3/3 |
-| dual | `3840x2160@59.997` | `sdr-native` | applied |
-| virtual-only | `3840x2160@59.997` | SDR | applied, 2/2 |
-| dual | `1920x1080@60.000` | `bt2100` | rejected |
-| dual | `3840x2160@29.970` | `bt2100` | rejected |
-| dual | `3840x2160@59.997` | `bt2100` | rejected, 3/3 |
-| virtual-only | `3840x2160@59.997` | `bt2100` | rejected |
-
-A rejected commit looks like this: `gdctl` exits 0, Mutter shows the new layout,
-`/sys/class/drm/card1-DP-3/enabled` stays `disabled`, the connector never gets a
-CRTC, and gnome-shell logs
-
-```text
-Page flip failed: drmModeAtomicCommit: Invalid argument
-```
-
-about thirty times a second until the layout is changed back.
-
-So bandwidth is not the limit — `1920x1080@60` fails in HDR while
-`3840x2160@60` succeeds in SDR. HDR over DisplayPort needs capability bits the
-driver reads out of the sink's DPCD, and a forged EDID cannot produce a link to
-read them from. HDMI is one-way TMDS: the HDR InfoFrame goes out with no
-handshake, which is why the `hdmi-hdr` branch gets HDR at the price of the HDMI
-port.
+GNOME reporting `bt2100` does not mean this forced DP path provides end-to-end
+HDR. The connector's `HDR_OUTPUT_METADATA` and `Colorspace` DRM properties are
+still zero, so Sunshine produces 10-bit SDR rather than HDR10. The main branch
+therefore defines DP-3 as SDR. See the [DP-3 HDR investigation](docs/dp-hdr-investigation.zh-CN.md)
+for the full exploration, older-stack results, Sunshine's source-level check,
+and two possible implementation paths.
 
 Sunshine captures the first live output it finds. It logged
 `Found connector ID [825]` (`DP-1`) while the physical display was the only live
@@ -298,6 +274,7 @@ config/       Sunshine configuration fragment
 
 ## Branches
 
-- `main` — the virtual display on `DP-3`, 4K60 SDR, HDMI port left free.
-- `hdmi-hdr` — the virtual display on `HDMI-A-1`, 4K60 HDR, HDMI port consumed
-  by the forged EDID whenever the virtual entry is booted.
+- `main` — the virtual display on `DP-3`, 4K60 SDR at 200% scale, HDMI port left
+  free.
+- `hdmi-hdr` — the virtual display on `HDMI-A-1`, 4K60 HDR, at the cost of the
+  HDMI port.
