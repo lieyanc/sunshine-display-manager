@@ -1,6 +1,6 @@
 [Unit]
 Description=Keep the Sunshine virtual connector out of the login screen
-Documentation=https://github.com/lieyanchy/sunshine-display-manager
+Documentation=https://github.com/lieyanc/sunshine-display-manager
 PartOf=graphical-session.target
 After=graphical-session.target
 

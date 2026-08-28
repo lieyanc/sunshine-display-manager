@@ -1,3 +1,7 @@
+# Reference copy of what install.sh writes into ~/.config/sunshine/sunshine.conf.
+# Sunshine runs global_prep_cmd without a shell, so the paths must be absolute:
+# replace /home/YOUR_USER with your own home directory, or just run install.sh,
+# which substitutes it for you.
 capture = kms
 encoder = nvenc
-global_prep_cmd = [{"do":"/home/lieyan/.local/bin/sunshine-displayctl stream-start","undo":"/home/lieyan/.local/bin/sunshine-displayctl stream-stop"}]
+global_prep_cmd = [{"do":"/home/YOUR_USER/.local/bin/sunshine-displayctl stream-start","undo":"/home/YOUR_USER/.local/bin/sunshine-displayctl stream-stop"}]
