@@ -162,6 +162,7 @@ GDM 50 起 greeter 以动态用户 `gdm-greeter` 运行，家目录是 tmpfs 上
   密码框）
 - 启停 Sunshine 服务
 - 打开 Sunshine Web 管理页面
+- 把虚拟屏的 HDR 亮度复位到 100% 参考白（仅在串流中的 HDR 虚拟屏上可点）
 - 强制恢复物理显示器
 
 查看服务日志：
@@ -185,6 +186,7 @@ sunshine-displayctl help
 状态    status  boot-status  port-status  verify
 显示    physical-only  virtual-only  both
         physical-on  physical-off  virtual-on  virtual-off  recover
+        luminance-reset
 连接器  attach  detach
 启动    boot-virtual  boot-stock  boot-cancel
 端口    port-dp  port-hdmi
@@ -197,6 +199,12 @@ Sunshine 的会话钩子，`attach` 和 `detach` 是连接器钩子，都不需�
 
 `recover` 会停止串流抑制器、清除运行时会话状态、交还虚拟连接器，并强制把 `DP-1`
 恢复到 `1920x1080@165.001` SDR。
+
+`luminance-reset` 把虚拟屏的 HDR 亮度调回 100%。Mutter 把 HDR 输出的参考亮度当作
+背光暴露出来，顶栏的亮度滑块改的就是它；100% 对应 BT.2408 图形参考白，也就是桌面
+被编码进 PQ 信号时依据的白电平，任何其他值都会让客户端看到的 SDR 内容偏亮或发灰。
+这个控制随连接器一起出现和消失，所以只在虚拟屏挂载且处于 HDR 时可用，`stream-stop`
+也就没有必要去复位它。
 
 `port-dp` 和 `port-hdmi` 是唯二会要密码的命令：在终端里走 `sudo`，从状态栏调用时走
 `pkexec`。其余命令要么不需要权限，要么走免密的

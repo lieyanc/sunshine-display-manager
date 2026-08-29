@@ -16,6 +16,14 @@ readonly PORT_CONFIG="/etc/default/sunshine-display-manager"
 readonly DEFAULT_PORT_CONNECTOR="DP-3"
 readonly BOOT_PENDING_MARKER="/run/sunshine-display-boot-pending"
 readonly INHIBIT_SERVICE="sunshine-display-inhibit.service"
+readonly DISPLAY_CONFIG_DEST="org.gnome.Mutter.DisplayConfig"
+readonly DISPLAY_CONFIG_PATH="/org/gnome/Mutter/DisplayConfig"
+# Mutter models the HDR reference luminance of an output as a backlight, so the
+# top bar's brightness slider writes to it even though a forced connector has
+# nothing to dim. 100% is BT.2408 graphics white, the level the desktop is
+# encoded against; any other value moves where SDR content lands in the PQ
+# signal the client decodes, which reads as washed out or dim on the far end.
+readonly REFERENCE_LUMINANCE=100
 
 uid=$(id -u)
 : "${XDG_RUNTIME_DIR:=/run/user/${uid}}"
@@ -577,9 +585,61 @@ monitor_block() {
   ' <<<"$2"
 }
 
+# gdctl prints the luminance but not the serial SetBacklight insists on, so the
+# raw property is the only source that carries both.
+backlight_state() {
+  gdbus call --session --dest "$DISPLAY_CONFIG_DEST" \
+    --object-path "$DISPLAY_CONFIG_PATH" \
+    --method org.freedesktop.DBus.Properties.Get \
+    "$DISPLAY_CONFIG_DEST" Backlight 2>/dev/null
+}
+
+backlight_serial() {
+  sed -n 's/^(<(uint32 \([0-9][0-9]*\),.*/\1/p' <<<"$1"
+}
+
+# Every output Mutter can dim arrives in one array. The per-output dictionaries
+# do not nest, so they can be split apart and matched on the connector rather
+# than reading a value that belongs to a different monitor.
+backlight_value() {
+  local entry
+
+  entry=$(grep -o '{[^{}]*}' <<<"$2" | grep -F "'connector': <'$1'>") || return 1
+  sed -n "s/.*'value': <\(-\?[0-9][0-9]*\)>.*/\1/p" <<<"$entry" | grep . || return 1
+}
+
+# The control only exists while the virtual display is attached and in HDR, which
+# is why this is not part of stream-stop: by the time the connector goes back
+# there is nothing left to reset.
+luminance_reset() {
+  local state serial value
+
+  require_gnome_session
+  state=$(backlight_state) || state=""
+  value=$(backlight_value "$VIRTUAL_CONNECTOR" "$state") || value=""
+  if [[ -z "$value" ]]; then
+    printf 'Mutter reports no luminance control for %s.\n' "$VIRTUAL_CONNECTOR" >&2
+    printf 'It only exists while the virtual display is attached and in HDR.\n' >&2
+    return 1
+  fi
+  if [[ "$value" == "$REFERENCE_LUMINANCE" ]]; then
+    printf 'The virtual display is already at the %s%% reference.\n' \
+      "$REFERENCE_LUMINANCE"
+    return 0
+  fi
+  serial=$(backlight_serial "$state")
+  gdbus call --session --dest "$DISPLAY_CONFIG_DEST" \
+    --object-path "$DISPLAY_CONFIG_PATH" \
+    --method "${DISPLAY_CONFIG_DEST}.SetBacklight" \
+    "$serial" "$VIRTUAL_CONNECTOR" "$REFERENCE_LUMINANCE" >/dev/null
+  printf 'Reset %s from %s%% to the %s%% reference.\n' "$VIRTUAL_CONNECTOR" \
+    "$value" "$REFERENCE_LUMINANCE"
+}
+
 print_status_json() {
   local topology physical=false virtual=false sunshine=false hdr=false auto=false stream=false
   local display_state attached=false injected=false port configured
+  local backlight luminance
 
   load_settings
   load_runtime_state
@@ -605,6 +665,10 @@ print_status_json() {
     grep -E 'color-mode[^[:alpha:]].*bt2100' >/dev/null; then
     hdr=true
   fi
+  # Absent rather than 100 when Mutter offers no control, so the indicator can
+  # tell "nothing to reset" apart from "already at the reference".
+  backlight=$(backlight_state) || backlight=""
+  luminance=$(backlight_value "$VIRTUAL_CONNECTOR" "$backlight") || luminance=""
   if ((AUTO_HIDE_PHYSICAL)); then
     auto=true
   fi
@@ -618,6 +682,8 @@ print_status_json() {
     "$topology" "$physical" "$virtual"
   printf '"virtual_hdr":%s,"sunshine":%s,"stream_active":%s,' \
     "$hdr" "$sunshine" "$stream"
+  printf '"virtual_luminance":%s,"luminance_reference":%s,' \
+    "${luminance:-null}" "$REFERENCE_LUMINANCE"
   printf '"auto_hide_physical":%s,' "$auto"
   printf '"virtual_injected":%s,"virtual_attached":%s,' "$injected" "$attached"
   printf '"virtual_port":"%s","virtual_port_configured":"%s",' "$port" "$configured"
@@ -656,6 +722,7 @@ Displays
   virtual-on          keep the virtual display on, adding it if needed
   virtual-off         turn the virtual display off, keeping the physical one
   recover             force the physical display back and clear session state
+  luminance-reset     put the virtual display back to the 100% HDR reference
 
 Boot mode
   boot-virtual        boot the virtual display entry next and reboot now
@@ -713,6 +780,7 @@ case "${1:-status}" in
   stream-start) stream_start ;;
   stream-stop) stream_stop ;;
   recover) recover_physical ;;
+  luminance-reset) luminance_reset ;;
   verify) verify_configurations ;;
   boot-status)
     printf 'boot_mode=%s\n' "$(boot_mode)"

@@ -190,6 +190,8 @@ offers:
   confirmation dialog and a polkit password prompt
 - Starting and stopping the Sunshine service
 - Opening the Sunshine web UI
+- Resetting the virtual display's HDR brightness to the 100% reference, enabled
+  only while a stream is running on the HDR virtual display
 - Forcing the physical display back
 
 Service logs:
@@ -214,6 +216,7 @@ sunshine-displayctl help
 Status      status  boot-status  port-status  verify
 Displays    physical-only  virtual-only  both
             physical-on  physical-off  virtual-on  virtual-off  recover
+            luminance-reset
 Connector   attach  detach
 Boot mode   boot-virtual  boot-stock  boot-cancel
 Port        port-dp  port-hdmi
@@ -227,6 +230,14 @@ With no argument it prints one line of JSON for the indicator and for scripts.
 
 `recover` stops the streaming inhibitor, clears the runtime session state, hands
 the virtual connector back and forces `DP-1` back to `1920x1080@165.001` SDR.
+
+`luminance-reset` puts the virtual display's HDR brightness back to 100%. Mutter
+models the reference luminance of an HDR output as a backlight, which is what the
+top bar's brightness slider writes to; 100% is BT.2408 graphics white, the level
+the desktop is encoded against, and any other value moves where SDR content lands
+in the PQ signal the client decodes. The control appears and disappears with the
+connector, so it only works while the virtual display is attached and in HDR, and
+`stream-stop` has nothing left to reset by the time it runs.
 
 `port-dp` and `port-hdmi` are the only commands that ask for a password: they use
 `sudo` from a terminal and `pkexec` from the indicator. Everything else either

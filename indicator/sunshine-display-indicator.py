@@ -26,6 +26,12 @@ PORTS = {
     "hdmi": {"label": "HDMI (HDR)", "short": "HDMI", "command": "port-hdmi"},
 }
 
+# Mutter models the HDR reference luminance as a backlight, so the top bar's
+# brightness slider changes how SDR content lands in the PQ signal the client
+# decodes. 100% is the only value the stream is colour correct at, and a stray
+# brightness key during a session is the one way to leave it.
+REFERENCE_LUMINANCE = 100
+
 
 def confirm(question, detail):
     dialog = Gtk.MessageDialog(
@@ -140,11 +146,18 @@ class Indicator:
         menu.append(web_item)
         menu.append(Gtk.SeparatorMenuItem())
 
+        self.luminance_item = Gtk.MenuItem(label="复位 HDR 亮度")
+        self.luminance_item.connect(
+            "activate", lambda _item: self.run_controller("luminance-reset")
+        )
+        menu.append(self.luminance_item)
+
         recover_item = Gtk.MenuItem(label="救急：恢复物理显示器")
         recover_item.connect("activate", lambda _item: self.run_controller("recover"))
         menu.append(recover_item)
 
         quit_item = Gtk.MenuItem(label="退出状态栏图标")
+
         quit_item.connect("activate", Gtk.main_quit)
         menu.append(quit_item)
 
@@ -272,6 +285,21 @@ class Indicator:
         self.boot_virtual_item.set_sensitive(boot_mode != "virtual")
         self.boot_stock_item.set_sensitive(boot_mode == "virtual")
         self.boot_cancel_item.set_sensitive(boot_pending != "none")
+        # Only a streaming HDR virtual display has a reference to be off, and the
+        # control disappears with the connector, so the item is dead weight for
+        # every other topology.
+        luminance = state.get("virtual_luminance")
+        reference = state.get("luminance_reference", REFERENCE_LUMINANCE)
+        if luminance is None:
+            self.luminance_item.set_label("复位 HDR 亮度")
+        else:
+            self.luminance_item.set_label(f"复位 HDR 亮度 (当前 {luminance}%)")
+        self.luminance_item.set_sensitive(
+            bool(state["stream_active"])
+            and bool(state["virtual_hdr"])
+            and luminance is not None
+            and luminance != reference
+        )
         self.virtual_item.set_active(state["virtual"])
         self.physical_item.set_active(state["physical"])
         self.auto_item.set_active(state["auto_hide_physical"])
@@ -288,6 +316,12 @@ class Indicator:
         else:
             virtual = "虚拟关"
         stream = " | 串流中" if state["stream_active"] else ""
+        # Worth a word only when it is off the reference: the point is to notice a
+        # stray brightness change during a session, when the colours are wrong but
+        # nothing else in the menu says why.
+        drift = ""
+        if luminance is not None and luminance != reference:
+            drift = f" | 亮度 {luminance}%"
         pending = ""
         if boot_pending == "virtual":
             pending = " | 下次启动：虚拟显示器条目"
@@ -296,7 +330,7 @@ class Indicator:
         if self.virtual_port_configured != self.virtual_port:
             queued = PORTS.get(self.virtual_port_configured, PORTS["dp"])["short"]
             pending += f" | 下次启动：虚拟屏切到 {queued}"
-        self.status_item.set_label(f"{physical} | {virtual}{stream}{pending}")
+        self.status_item.set_label(f"{physical} | {virtual}{stream}{drift}{pending}")
 
         if state["stream_active"]:
             icon = "network-transmit-receive-symbolic"
